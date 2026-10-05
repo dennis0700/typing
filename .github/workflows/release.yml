@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build:
+    name: Build (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run tests
+        run: cargo test --release --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Generate app icon (.icns)
+        run: |
+          ICONSET=dist/AppIcon.iconset
+          mkdir -p "$ICONSET"
+          for size in 16 32 128 256 512; do
+            sips -z $size $size assets/icon.png --out "$ICONSET/icon_${size}x${size}.png"
+            double=$((size * 2))
+            sips -z $double $double assets/icon.png --out "$ICONSET/icon_${size}x${size}@2x.png"
+          done
+          iconutil -c icns "$ICONSET" -o dist/AppIcon.icns
+
+      - name: Build .app bundle
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          APP=dist/打字学习.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/typing "$APP/Contents/MacOS/typing"
+          chmod +x "$APP/Contents/MacOS/typing"
+          cp dist/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>打字学习</string>
+            <key>CFBundleDisplayName</key>
+            <string>打字学习</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.dennis0700.typing</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundleExecutable</key>
+            <string>typing</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Package .dmg
+        run: |
+          hdiutil create -volname "打字学习" -srcfolder "dist/打字学习.app" -ov -format UDZO "dist/typing-${{ github.ref_name }}-macos.dmg"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: typing-${{ github.ref_name }}-macos
+          path: dist/typing-${{ github.ref_name }}-macos.dmg
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: typing-${{ github.ref_name }}-macos
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/typing-${{ github.ref_name }}-macos.dmg
+          generate_release_notes: true

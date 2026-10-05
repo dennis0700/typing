@@ -1,0 +1,295 @@
+// 课程序列界面（Req 1.2, 1.6, 1.7）。
+//
+// 本组件仅负责按课程卡片的视图模型渲染可点击/禁用样式与解锁条件提示文案，
+// 不在 `.slint` 中编写"课程是否解锁"的业务判断逻辑——`LessonState`
+// （Locked / Unlocked / Unavailable）到"是否可点击"、"提示文案是什么"的
+// 映射完全由 Rust 侧（`domain::curriculum::LessonState` +
+// `app_state::curriculum_state::CurriculumState`，未来任务 18.8 桥接层）
+// 计算好后，以 `LessonCardData` 数组的形式一次性传入本组件。
+//
+// 设计取舍说明（与 virtual_keyboard.slint 保持一致的原则）：
+// Slint 的 `function`/`pure function` 体内不支持对数组做命令式遍历，
+// 也没有可用于"集合成员判断"的内建方法；而"课程是否可点击"本身也不是
+// 单纯的枚举取值问题——它还依赖 Req 1.7 的语义（未解锁课程被点击时应
+// 阻止进入并展示解锁条件提示，而不是完全不响应点击）。因此本组件采取
+// 以下策略：
+// 1. 每张卡片始终响应点击（`TouchArea` 始终可点击，保证 Unlocked 课程可
+//    点击进入 Req 1.6，同时 Locked/Unavailable 课程点击后仍需某种反馈）；
+// 2. 是否真正"可进入"（触发 `lesson-selected`）还是"被阻止并提示解锁
+//    条件"，由 Rust 侧调用方决定：本组件对 `Unlocked` 状态发出
+//    `lesson-selected(index)`，对 `Locked`/`Unavailable` 状态发出
+//    `locked-lesson-tapped(index)`（携带解锁条件提示文案供调用方展示
+//    Toast，也可直接读取卡片上常驻渲染的 `unlock-hint` 文案）。这样
+//    "点击未解锁课程会发生什么"这一业务判断（Req 1.7：阻止进入 + 显示
+//    提示信息）仍完全落在 Rust 侧（未来任务 18.8），`.slint` 侧只负责
+//    区分并转发这两类点击、以及渲染对应的可点击/禁用视觉样式。
+//
+// `LessonState` 枚举与 Rust `domain::curriculum::LessonState` 一一对应
+// （Slint 枚举成员使用 kebab-case）。`Unavailable` 分支在 Rust 侧携带
+// `String` 原因文本，本组件不重复该字段——`LessonCardData.unlock-hint`
+// 已经承载了"该状态下应展示的提示文案"（无论是解锁条件说明还是"课程当前
+// 不可用"提示），避免在 `.slint` 内拼接不同状态对应的不同文案模板。
+
+import { Theme } from "theme.slint";
+
+export enum LessonState {
+    // 尚未满足前置课程的解锁条件（对应 Rust `LessonState::Locked`）。
+    locked,
+    // 可进入练习（对应 Rust `LessonState::Unlocked`）。
+    unlocked,
+    // 课程配置缺失/损坏或存在冲突，无法参与解锁判定
+    // （对应 Rust `LessonState::Unavailable(reason)`，Req 1.8, 8.4）。
+    unavailable,
+}
+
+// 单张课程卡片所需的最小视图模型（对应 Req 1.2, 1.6, 1.7 的渲染需求）。
+// `state` 到"可点击/禁用样式"、"是否展示 unlock-hint"的映射规则完全由
+// 本组件内部按 `state` 分支渲染决定；而 `state` 本身的计算（课程解锁判定）
+// 与 `unlock-hint` 的具体文案内容均由 Rust 侧调用方在构造该数组时给出。
+export struct LessonCardData {
+    // 课程标题/标签文本，如"认识 ASDF 键位"。
+    title: string,
+    // 课程学习目标的简短描述，如"单键练习"/"词语练习"/"句子练习"。
+    subtitle: string,
+    // 当前解锁状态，决定卡片是否可点击进入以及展示样式。
+    state: LessonState,
+    // 解锁条件提示文案（Req 1.7），如"完成上一课程后解锁"；
+    // `state` 为 `unavailable` 时，本字段承载"该课程当前不可用"一类提示；
+    // `state` 为 `unlocked` 时该字段应为空字符串（不展示提示区域）。
+    unlock-hint: string,
+}
+
+export component CurriculumMap inherits Rectangle {
+    // 按课程序列顺序排列的课程卡片视图模型（Req 1.2）。
+    in property <[LessonCardData]> lessons: [];
+
+    // 学员点击一张 `unlocked` 状态的课程卡片时触发，携带该课程在
+    // `lessons` 数组中的索引，供调用方（未来 `ui.rs` 桥接层，任务 18.8）
+    // 转发为 `AppEvent::SelectLesson`（Req 1.6）。本组件不做导航，
+    // 仅转发点击意图。
+    callback lesson-selected(int);
+
+    // 学员点击一张 `locked`/`unavailable` 状态的课程卡片时触发，携带该
+    // 课程的索引，供调用方阻止进入并展示解锁条件提示（Req 1.7）。
+    // 卡片自身也会常驻渲染 `unlock-hint` 文案，本回调主要用于调用方
+    // 额外展示 Toast/强调反馈（如三次点击后的更明显提示），业务判断
+    // 仍完全在 Rust 侧。
+    callback locked-lesson-tapped(int);
+
+    // 学员点击左上角"返回"时触发，供调用方转发为
+    // `AppEvent::ExitToProfileSelect`（回到档案选择界面切换学员/管理档案）。
+    // 与 `lesson-selected` 一样，本组件只转发意图，不自行导航。
+    callback back-requested();
+
+    // 课程卡片的固定高度与卡片间距。
+    //
+    // 为什么必须是"确定的固定值"而不是让布局自行推导：
+    // `Flickable` 内部一旦包含 repeater（`for ... in ...` 生成的元素），
+    // Slint 无法从被重复的元素推导出 viewport 的尺寸约束
+    // （slint-ui/slint#407），而"由布局自动设置 flickable 的
+    // viewport-width/viewport-height"至今仍是未实现的功能诉求
+    // （slint-ui/slint#178）。因此卡片高度必须是一个确定的具名常量，
+    // 下方 `viewport-height` 才能按「条目数 × (卡片高度 + 间距)」算出
+    // 真实内容高度。请勿把这两个常量或 `viewport-*` 的显式赋值当作
+    // 冗余代码"清理"掉——去掉后 12 张课程卡片会因 viewport 高度为 0
+    // 而完全不可见、也无法滚动。
+    //
+    // 96px 是能容纳单张卡片三行内容的取值：上下 padding 各 12px +
+    // 标题行（16px 字号）+ 4px + 副标题（13px 字号）+ 4px +
+    // 解锁提示（12px 字号，Req 1.7）。
+    private property <length> card-height: 96px;
+    private property <length> card-spacing: 8px;
+
+    background: Theme.muted;
+
+    // 外层布局**不能**写 `alignment: start`：Slint 中 alignment 一旦不是
+    // 默认的 `stretch`，布局就不再把剩余空间分配给子元素，`*-stretch`
+    // 因子会被完全忽略。那样下方 `Rectangle { vertical-stretch: 1 }` 只能
+    // 拿到自身的首选高度，而它内部唯一的子元素是 `Flickable`
+    // （Flickable 不会把 viewport 尺寸上报为自己的首选尺寸），首选高度即 0
+    // → `Flickable { height: 100% }` 也是 0 → 1248px 的课程卡片内容被裁进
+    // 0 高的可视区，整个列表不可见。因此这里保持默认的 stretch 语义，
+    // 并显式把"不应吃掉剩余空间"的子元素标为 `vertical-stretch: 0`。
+    VerticalLayout {
+        padding: 24px;
+        spacing: 16px;
+
+        // 标题行：左侧"返回"按钮 + 居中标题。
+        //
+        // 右侧放一个与返回按钮等宽的占位块，使标题在视觉上仍严格居中——否则
+        // 标题会被左侧按钮挤向右边，与其他页面的标题位置不一致。
+        HorizontalLayout {
+            // 整行按首选高度渲染，不参与剩余空间分配（否则会被拉高、挤掉
+            // 列表区的高度）。
+            vertical-stretch: 0;
+            spacing: 8px;
+
+            back-button := TouchArea {
+                min-width: 88px;
+                min-height: 44px;
+
+                clicked => {
+                    root.back-requested();
+                }
+
+                Rectangle {
+                    width: 100%;
+                    height: 100%;
+                    border-radius: Theme.radius-sm;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    background: back-button.has-hover ? Theme.secondary-hover : Theme.secondary;
+
+                    animate background {
+                        duration: 120ms;
+                    }
+
+                    Text {
+                        text: "← 返回";
+                        font-size: 15px;
+                        font-weight: 700;
+                        color: Theme.secondary-foreground;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            Text {
+                horizontal-stretch: 1;
+                text: "课程序列";
+                font-size: 24px;
+                font-weight: 700;
+                color: Theme.foreground;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            // 与返回按钮等宽的占位块，保证标题居中。
+            Rectangle {
+                width: 88px;
+            }
+        }
+
+        // 列表容器：本页唯一吃掉剩余竖直空间的元素，Flickable 的
+        // `height: 100%` 依赖它拿到非 0 高度。
+        Rectangle {
+            vertical-stretch: 1;
+
+            lesson-list := Flickable {
+                width: 100%;
+                height: 100%;
+
+                // 显式给出 viewport 尺寸：repeater 生成的卡片无法参与
+                // viewport 尺寸推导（见组件属性区 card-height 注释中的
+                // slint-ui/slint#407 / #178），所以内容高度必须由
+                // 「条目数 × (卡片高度 + 卡片间距)」显式算出。
+                // 12 门课程 × (96px + 8px) = 1248px，远超 640px 窗口高度，
+                // 因此这里算出的 viewport-height 也正是滚动能真正生效的前提。
+                viewport-width: self.width;
+                viewport-height: root.lessons.length * (root.card-height + root.card-spacing);
+
+                VerticalLayout {
+                    spacing: 8px;
+                    // 这一层的 `alignment: start` 必须**保留**：它让卡片按
+                    // 各自的首选高度（card-height）从顶部依次排布、不被拉伸
+                    // 平分 viewport 高度。与外层布局不同，这里正是想要
+                    // "不分配剩余空间"的语义。
+                    alignment: start;
+
+                    for lesson-data[i] in root.lessons: lesson-card := TouchArea {
+                        // 卡片高度取确定的具名常量而非交给布局推导（见上方
+                        // viewport 注释）。这里用 `min-height` 而非 `height`：
+                        // Slint 不允许在同一元素上同时指定 `height` 与
+                        // `min-height`，而 `min-height` 同时承担"固定高度"
+                        // （TouchArea 自身无固有尺寸，布局取被下限钳制后的
+                        // 首选高度）与"≥44px 最小可点击区域"（Req 7.1）两重
+                        // 职责；卡片间距由外层 VerticalLayout 的 spacing: 8px 保证。
+                        min-height: root.card-height;
+
+                        clicked => {
+                            if lesson-data.state == LessonState.unlocked {
+                                root.lesson-selected(i);
+                            } else {
+                                root.locked-lesson-tapped(i);
+                            }
+                        }
+
+                        Rectangle {
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: Theme.border;
+
+                            // 可点击 vs 禁用的样式区分（Req 1.6, 1.7）：
+                            // - unlocked：白底，悬停时轻微变灰，提示可交互。
+                            // - locked/unavailable：灰底降低不透明度，视觉上
+                            //   明确区别于可点击卡片，即使仍能响应点击事件
+                            //   （用于转发 locked-lesson-tapped）。
+                            // 悬停时整张卡片换底色（`Theme.card-hover`，浅蓝）。
+                            //
+                            // 这里**不能**用 `Theme.accent`：它与 `Theme.muted`
+                            // （未解锁卡片的底色）是同一个值，用它做悬停会让鼠标
+                            // 指到的卡片变成和"锁定"一样的灰，看起来像高亮跑到了
+                            // 别的行。详见 `theme.slint` 中 `card-hover` 的说明。
+                            property <bool> highlighted: lesson-data.state == LessonState.unlocked
+                                && lesson-card.has-hover;
+
+                            background: lesson-data.state == LessonState.unlocked
+                                ? (highlighted ? Theme.card-hover : Theme.card)
+                                : Theme.muted;
+                            opacity: lesson-data.state == LessonState.unlocked ? 1.0 : 0.65;
+
+                            animate background, opacity {
+                                duration: 120ms;
+                            }
+
+                            VerticalLayout {
+                                padding: 12px;
+                                spacing: 4px;
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: space-between;
+
+                                    Text {
+                                        text: lesson-data.title;
+                                        font-size: 16px;
+                                        font-weight: 700;
+                                        color: lesson-data.state == LessonState.unlocked
+                                            ? Theme.card-foreground
+                                            : Theme.muted-foreground;
+                                        vertical-alignment: center;
+                                    }
+
+                                    // 未解锁/不可用状态的锁形标识，与可点击卡片
+                                    // 形成直观的视觉区分。
+                                    if lesson-data.state != LessonState.unlocked: Text {
+                                        text: "🔒";
+                                        font-size: 16px;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                Text {
+                                    text: lesson-data.subtitle;
+                                    font-size: 13px;
+                                    color: Theme.muted-foreground;
+                                }
+
+                                // 解锁条件提示文案（Req 1.7）：仅在非 unlocked
+                                // 状态且提示文案非空时展示，例如
+                                // "完成上一课程后解锁"或"该课程当前不可用"。
+                                if lesson-data.state != LessonState.unlocked && lesson-data.unlock-hint != "": Text {
+                                    text: lesson-data.unlock-hint;
+                                    font-size: 12px;
+                                    color: Theme.destructive;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,555 @@
+// 虚拟键盘组件。
+//
+// 设计取舍说明（对应任务 18.4 的“最少 Rust 侧粘合”要求）：
+// Rust 侧的 `domain::keyboard_layout::zone_color_token` 返回的是字符串 token
+// （如 "finger-zone-left-pinky"），而不是可直接用于渲染的 `color` 值。
+// Slint 无法从 .slint 文件中直接调用任意 Rust 函数来做 token -> color 的转换，
+// 若要求 Rust 侧把 token 解析为 color 再传入，则每新增/调整一个分区颜色都需要
+// 同步修改 Rust 桥接代码（`ui.rs`，任务 18.8）。
+//
+// 因此这里选择：在本文件内以 `FingerZoneColors` global 的形式，直接定义与
+// `zone_color_token` 中 10 个 token 语义一一对应的 10 个颜色常量（复用相同的
+// 命名语义：left-pinky / left-ring / left-middle / left-index / left-thumb /
+// right-thumb / right-index / right-middle / right-ring / right-pinky）。
+// 本组件对外暴露的 `KeyInfo.zone` 属性使用与 Rust `FingerZone` 一一对应的
+// `FingerZoneId` 枚举（而非裸字符串），由调用方（未来的 `ui.rs` 桥接层，
+// 任务 18.8）把 `FingerZone` 映射为该枚举即可，无需解析颜色字符串、无需在
+// Rust 侧新增颜色常量——颜色的唯一权威定义留在本文件中，保证本组件自洽。
+//
+// 另一处取舍：Slint 函数体内不支持对数组做命令式遍历（`for` 语法只用于
+// 元素重复，不能出现在 `function` 内部），也没有字符串/数组的
+// `contains`/`index-of` 成员函数可用于集合成员判定。因此本组件不在内部
+// 计算“某个标签是否在当前课程涉及键位集合中”，而是把这一判定完全交给
+// 调用方（未来 `ui.rs` 桥接层，任务 18.8）：`VirtualKeyboard` 直接接收
+// 一个按键盘物理布局顺序排好的 `KeyState` 数组，每个元素自带
+// `is-active`/`is-hint` 布尔值。这样 `.slint` 侧只负责渲染，不做集合运算，
+// 符合设计文档“UI 层不编写业务判断逻辑”的原则。
+
+import { Theme } from "theme.slint";
+
+export enum FingerZoneId {
+    left-pinky,
+    left-ring,
+    left-middle,
+    left-index,
+    left-thumb,
+    right-thumb,
+    right-index,
+    right-middle,
+    right-ring,
+    right-pinky,
+}
+
+// 手指分区 -> 颜色 的唯一权威映射（与 Req 2.1 对应：10 个分区使用 10 个
+// 互不相同、可区分的颜色；同一分区所有按键颜色相同——因为都从这一张表取色）。
+export global FingerZoneColors {
+    out property <color> left-pinky: Theme.zone-left-pinky;
+    out property <color> left-ring: Theme.zone-left-ring;
+    out property <color> left-middle: Theme.zone-left-middle;
+    out property <color> left-index: Theme.zone-left-index;
+    out property <color> left-thumb: Theme.zone-left-thumb;
+    out property <color> right-thumb: Theme.zone-right-thumb;
+    out property <color> right-index: Theme.zone-right-index;
+    out property <color> right-middle: Theme.zone-right-middle;
+    out property <color> right-ring: Theme.zone-right-ring;
+    out property <color> right-pinky: Theme.zone-right-pinky;
+
+    // 按 FingerZoneId 取色的辅助函数，供本文件内 KeyButton 使用，
+    // 避免在每个按键实例上重复写 if/else 链。
+    public pure function color-of(zone: FingerZoneId) -> color {
+        if zone == FingerZoneId.left-pinky {
+            return left-pinky;
+        } else if zone == FingerZoneId.left-ring {
+            return left-ring;
+        } else if zone == FingerZoneId.left-middle {
+            return left-middle;
+        } else if zone == FingerZoneId.left-index {
+            return left-index;
+        } else if zone == FingerZoneId.left-thumb {
+            return left-thumb;
+        } else if zone == FingerZoneId.right-thumb {
+            return right-thumb;
+        } else if zone == FingerZoneId.right-index {
+            return right-index;
+        } else if zone == FingerZoneId.right-middle {
+            return right-middle;
+        } else if zone == FingerZoneId.right-ring {
+            return right-ring;
+        } else {
+            return right-pinky;
+        }
+    }
+}
+
+// 键盘几何度量的唯一权威定义。
+//
+// 真实键盘的每一行长度相同、行内按键按“键位单位（unit，即 1u 字母键宽）”
+// 的倍数排布：数字行末尾的 Backspace 占 2u、Tab 1.5u、Caps Lock 1.75u、
+// Enter 2.25u、左右 Shift 2.25u/2.75u、空格 6.25u……每一行的单位总和都是
+// 15u。本 global 把“单位 -> 像素宽度”的换算集中到 `span()` 一处：宽度为
+// n 个单位的键，会跨越 n 个单位格与其间的 (n-1) 个间隙，因此
+// `span(n) = n * unit + (n - 1) * gap`。只要每行单位总和相等，各行左右
+// 边缘就会严格对齐，视觉上才像一块完整的键盘而不是几排错位的方块。
+export global KeyMetrics {
+    out property <length> unit: 44px; // 1u：字母键的边长（同时也是行高）
+    out property <length> gap: 6px; // 相邻键之间的缝隙
+    out property <length> case-padding: 14px; // 键盘外壳内边距
+    out property <float> row-units: 15.0; // 每行的单位总和（标准 ANSI 布局）
+    out property <int> row-count: 5;
+
+    // 单位数 -> 实际像素宽度。
+    public pure function span(units: float) -> length {
+        return units * unit + (units - 1) * gap;
+    }
+
+    out property <length> board-width: span(row-units) + 2 * case-padding;
+    out property <length> board-height: row-count * unit + (row-count - 1) * gap + 2 * case-padding;
+}
+
+// 单个按键的完整渲染状态：静态描述（标签 + 所属手指分区）+ 动态状态
+// （是否为当前课程涉及键位 / 是否为当前唯一的键位提示）。
+//
+// `is-hint` 字段虽然按键位逐一携带，但“同一时刻仅一个提示”这一约束由
+// `default-key-layout()`/调用方在构造这个数组时保证：调用方只应把
+// 集合中至多一个元素的 `is-hint` 置为 `true`（对应 Req 2.3）。本组件
+// 不做也不需要做运行时校验——即使调用方违反约定传入多个 `true`，视觉上
+// 也只是多个按键同时高亮，不会导致本组件崩溃或类型错误；正确性保证
+// 由 Rust 侧生成该数组的唯一函数（未来 `ui.rs`）以数据结构方式承担。
+export struct KeyState {
+    label: string,
+    zone: FingerZoneId,
+    is-active: bool,
+    is-hint: bool,
+    // 当前提示字符是否需要按住 Shift 才能输入该键（Req 2.3 的扩展：Shift
+    // 组合符号/大写字母的提示不仅要指出物理键位，还要指出需要同时按 Shift）。
+    // 仅在 `is-hint` 为 true 时才有意义；其余按键这一字段恒为 false。
+    needs-shift: bool,
+    // 该键按住 Shift 后输入的字符（如 `;` 键的 `":"`），与真实键盘键帽上
+    // "下档/上档"两个字符的印刷方式一致。空字符串表示该键没有 Shift 变体
+    // （字母键——大写字母不再重复印在键帽上，`label` 本身已是大写；以及
+    // 空格键）。与 `is-hint`/`needs-shift` 无关：只要键位本身有 Shift
+    // 组合字符，就在**任何课程**下恒定显示，不随当前提示状态变化——这是本
+    // 组件与"提示"语义完全独立的第三条信息通道。
+    shift-label: string,
+}
+
+// 单个按键的渲染组件：
+// - 底色始终按 `state.zone` 对应的分区颜色渲染（Req 2.1）。
+// - `state.is-active` 表示该键属于当前课程涉及的键位集合，保持常驻高亮
+//   （Req 2.2：进入课程时高亮显示涉及按键及分区标识）。
+// - `state.is-hint` 表示该键当前是唯一的“待按键位提示”，用与分区底色
+//   可区分的高亮边框叠加显示（Req 2.3）。
+component KeyButton inherits Rectangle {
+    in property <KeyState> state;
+    // 该键占据的键位单位数（1u = 字母键宽），空格等宽键由调用处覆写。
+    in property <float> units: 1.0;
+    // 该键是否正被按下（敲击反馈，由 `VirtualKeyboard.pressed-key-index` 驱动）。
+    in property <bool> pressed: false;
+
+    // 是否属于"本课要练的键位"：`is-active` 是课程涉及键位集合（Req 2.2），
+    // `is-hint` 是当前唯一的待按提示（Req 2.3）。
+    property <bool> highlighted: state.is-active || state.is-hint;
+
+    // 本课键位用饱和的分区色 + 白字；其余键位保留**同一个分区色相**但压到很低
+    // 的不透明度，只留一层淡淡的色底。
+    //
+    // 为什么是"淡化"而不是"变灰"：Req 2.1 要求虚拟键盘上每个手指分区都用唯一
+    // 且互相可区分的颜色标识、且同一分区的所有按键使用相同颜色。若把非本课
+    // 键位统一涂成中性灰，分区信息就从这些键上消失了。改用 `with-alpha` 只降
+    // 低同一色相的浓度，分区归属仍然可读（同一分区的键淡化程度也完全一致），
+    // 同时本课键位在视觉上明显跳出来——这正是"练 asdfg 时这几个键显眼、其余
+    // 键淡化"想要的效果。
+    //
+    // 不用 `opacity` 的原因：`opacity` 会连带把子元素（键帽标签）一起变淡，
+    // 淡到能让背景退后的程度时标签也就看不清了。`with-alpha` 只作用于背景色，
+    // 标签仍可用独立的前景色保持可读。
+    property <color> base-color: highlighted
+        ? FingerZoneColors.color-of(state.zone)
+        : FingerZoneColors.color-of(state.zone).with-alpha(0.22);
+
+    width: KeyMetrics.span(units);
+    height: KeyMetrics.unit;
+    // 本元素只是布局占位，真正的键帽是内层的 `cap`：键帽需要在按下时下沉，
+    // 而本元素的尺寸被 `KeyRow` 的布局使用，一旦改动就会引起整行重排。
+    background: transparent;
+
+    // 键帽。按下时同时做三件事，模拟真实键帽被压下去：
+    // 1. 整体下移 3px 并等量缩短，看起来"陷进"键盘面板；
+    // 2. 底色压暗一档；
+    // 3. 投影收掉（键帽贴到面板上，不再悬浮）。
+    // 三者都走 55ms 的短动画——比 120ms 的状态切换快得多，敲击才有"脆"的感觉。
+    cap := Rectangle {
+        y: root.pressed ? 3px : 0px;
+        width: 100%;
+        height: root.height - (root.pressed ? 3px : 0px);
+        border-radius: 6px;
+        background: root.pressed ? root.base-color.darker(0.25) : root.base-color;
+
+        // 键帽的立体感：仅本课键位保留投影，让它们看起来"浮"在其余键位之上。
+        drop-shadow-blur: root.pressed ? 0px : (root.highlighted ? 3px : 0px);
+        drop-shadow-offset-y: root.pressed ? 0px : (root.highlighted ? 1px : 0px);
+        drop-shadow-color: Theme.shadow;
+
+        // 键位提示：与分区底色在视觉上可区分的高亮边框（金色描边），
+        // 叠加在分区底色之上而不是替换底色。
+        border-width: root.state.is-hint ? 4px : 1px;
+        border-color: root.state.is-hint ? Theme.key-hint-ring : Theme.border;
+
+        animate y, height, background, drop-shadow-blur, drop-shadow-offset-y {
+            duration: 55ms;
+            easing: ease-out;
+        }
+
+        animate border-width, border-color {
+            duration: 120ms;
+        }
+
+        // 键帽标签：与真实键盘键帽的"上档/下档"印刷方式一致——
+        // `shift-label` 非空时（数字行、`-=[]\;',./` 等符号键），Shift 组合
+        // 字符印在上方（小字），基础字符印在下方（大字，与 Req 8.1 生成的
+        // 练习文本、Rust 侧 `key_to_char` 的取值保持视觉对应）；两行都水平
+        // 居中，与真实键盘键帽"上下堆叠、左右对齐"的排版一致（不用左上/
+        // 右下的斜对角布局——那种排版在小尺寸键帽上视觉上很凌乱）。
+        // `shift-label` 为空时（字母键——大写字母不重复印在键帽上，`label`
+        // 本身已是大写；以及空格键），退回单个字符居中显示，与此前行为一致。
+        //
+        // 这两个标签在**任何课程**下都恒定显示，不随 `is-active`/`is-hint`
+        // 变化——键帽上印着什么字符是键盘物理属性，不是课程相关的动态提示；
+        // 提示相关的视觉（金色描边、右上角的 ⇧ 徽标）叠加在标签之上，不替换它。
+        VerticalLayout {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            alignment: root.state.shift-label == "" ? center : space-around;
+            padding-top: root.state.shift-label == "" ? 0px : 2px;
+            padding-bottom: root.state.shift-label == "" ? 0px : 3px;
+
+            if root.state.shift-label != "": Text {
+                text: root.state.shift-label;
+                color: root.highlighted ? Theme.vivid-foreground : Theme.muted-foreground;
+                font-size: 10px;
+                font-weight: 600;
+                horizontal-alignment: center;
+            }
+
+            Text {
+                text: root.state.label;
+                // 淡色底上改用中性次要前景色，保证标签在两种状态下都可读。
+                color: root.highlighted ? Theme.vivid-foreground : Theme.muted-foreground;
+                font-size: 14px;
+                font-weight: root.highlighted ? 700 : 500;
+                horizontal-alignment: center;
+            }
+        }
+
+        // Shift 提示徽标：仅当本键当前是提示键位且该字符需要按住 Shift 才能
+        // 输入时显示（如提示"A"或":"这类 Shift 组合字符）。放在键帽右上角，
+        // 用与键位提示相同的高亮色，让"要按 Shift"这一额外信息与"按哪个键"
+        // 的金色描边视觉上关联；即使键帽已经常驻显示 `shift-label`，这个
+        // 徽标仍有独立价值——它标记的是"现在就要按 Shift"，而 `shift-label`
+        // 只是静态的键帽印刷，两者叠加互不遮挡（徽标固定在右上角，不受
+        // 上面 `VerticalLayout` 居中布局影响）。
+        if root.state.is-hint && root.state.needs-shift: Text {
+            x: root.width - self.width - 4px;
+            y: 3px;
+            text: "⇧";
+            color: Theme.key-hint-ring;
+            font-size: 12px;
+            font-weight: 700;
+        }
+    }
+}
+
+// 装饰性功能键（Tab / Caps Lock / Enter / Shift / 空格行修饰键 / Backspace）。
+//
+// 这些键不参与练习，也不在 `key-states` 数组中（Rust 侧 `KEY_LAYOUT_ORDER`
+// 仍然只有 48 个可练习键位，桥接契约保持不变）。它们只负责把每一行补齐到
+// 15u 并提供真实键盘的轮廓与错位（stagger）——正是这些键让字母区呈现出
+// “左边缘逐行递进”的键盘特征。因此这里刻意用中性灰白配色，避免与手指分区
+// 的 10 色语义冲突，也避免让用户误以为它们是练习目标。
+//
+// `highlighted`：仅 Shift 键在用到——当当前提示字符需要按住 Shift
+// （`KeyState.needs-shift`）时，两个 Shift 键都会用与键位提示相同的金色
+// 描边高亮，让"需要同时按 Shift"这件事在键盘上也有一个具体的落点，而不是
+// 只有目标键帽右上角的小徽标。其余 ChromeKey（Tab/Caps/Enter/…）不使用
+// 该属性，恒为 false。
+component ChromeKey inherits Rectangle {
+    in property <string> label;
+    in property <float> units: 1.0;
+    in property <bool> highlighted: false;
+
+    width: KeyMetrics.span(units);
+    height: KeyMetrics.unit;
+    border-radius: 6px;
+    background: Theme.background;
+    border-width: root.highlighted ? 4px : 1px;
+    border-color: root.highlighted ? Theme.key-hint-ring : Theme.border;
+
+    drop-shadow-blur: 2px;
+    drop-shadow-offset-y: 1px;
+    drop-shadow-color: Theme.shadow-soft;
+
+    animate border-width, border-color {
+        duration: 120ms;
+    }
+
+    Text {
+        text: root.label;
+        color: root.highlighted ? Theme.vivid-foreground : Theme.muted-foreground;
+        font-size: 11px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// 键盘一行：按顺序水平排列一组按键。
+component KeyRow inherits HorizontalLayout {
+    spacing: KeyMetrics.gap;
+    alignment: center;
+}
+
+// 虚拟键盘组件（标准 QWERTY 布局：数字行、QWERTY 行、ASDF 行、ZXCV 行、空格行）。
+//
+// 对外属性：
+// - `key-states`：按键盘物理布局顺序（数字行 -> QWERTY 行 -> ASDF 行 ->
+//   ZXCV 行 -> 空格）排列的 48 个 `KeyState`，每个元素已经带有该按键的
+//   分区、是否常驻高亮（Req 2.2）、是否为当前键位提示（Req 2.3）。
+//   调用方（未来 `ui.rs` 桥接层，任务 18.8）在 Rust 侧根据
+//   `Lesson.target_keys`（常驻高亮集合）与 `current_key_hint`
+//   （唯一提示键位）计算得出该数组，`.slint` 侧只做渲染，不做集合判断。
+// - 默认值 `default-key-layout()` 提供了完整的标准 QWERTY 键位/分区映射
+//   （与 Rust 侧 `domain::keyboard_layout::finger_zone_of` 保持一致），
+//   使组件在未接入 Rust 桥接层之前也能独立渲染出正确的分区底色，便于
+//   单独预览与验证。
+//
+// “同一时刻仅一个提示”的结构性保证：本组件把“提示”表达为
+// `key-states` 数组中每个元素自带的 `is-hint: bool` 字段，而不是一个
+// 全局的“当前提示按键索引”单值属性去反向驱动 48 个按键；这意味着
+// 该约束的落实责任在调用方构造数组时一次性满足（Rust 侧应仅对
+// `current_key_hint` 命中的那一个元素置 `is-hint: true`，其余全部为
+// `false`），而不是本组件运行时去做互斥校验。
+export component VirtualKeyboard inherits VerticalLayout {
+    in property <[KeyState]> key-states: default-key-layout();
+
+    // 当前正被按下的键位在 `key-states` 中的下标；-1 表示没有键处于按下态。
+    //
+    // 声明为 `in-out` 而不是 `in`，是为了让**回弹**也留在 `.slint` 侧完成：
+    // Rust 侧在收到一次按键时只需把下标写进来（一次赋值），由下方的
+    // `release-timer` 在 90ms 后自己清回 -1。若声明为 `in`，Slint 无法写回，
+    // 就得在 Rust 侧再养一个定时器专门做"松手"这件纯视觉的事。
+    in-out property <int> pressed-key-index: -1;
+
+    // 当前提示键位是否需要按住 Shift（即 Rust 侧 `build_key_states` 计算出的
+    // "提示字符是否为 Shift 组合字符"）。用于驱动左右两个 Shift `ChromeKey`
+    // 的高亮——它们本身不在 `key-states` 数组中（Shift 不是可练习键位），
+    // 无法从数组里反推，因此由调用方（`ui.rs` 桥接层）单独计算并传入，
+    // 与 `.slint` 侧不做集合/业务判断的既有原则一致（本文件顶部设计取舍
+    // 说明：Slint 无法在表达式中对数组做 filter/map，只能由 Rust 侧算好
+    // 单值属性传进来）。
+    in property <bool> hint-needs-shift: false;
+
+    alignment: center;
+
+    // 按下态的自动回弹：`running` 由 `pressed-key-index != -1` 推导，因此
+    // Rust 侧写入下标即自动启动、清零后自动停止，无需额外开关。
+    //
+    // 已知边界：同一个键在 90ms 内被再次按下时，属性值没有变化，计时器不会
+    // 重新计时，回弹会略微提前。按每秒 11 次以上敲同一个键才会遇到，对儿童
+    // 打字练习不构成实际问题。
+    release-timer := Timer {
+        interval: 90ms;
+        running: root.pressed-key-index != -1;
+        triggered => {
+            root.pressed-key-index = -1;
+        }
+    }
+
+    // 标准 QWERTY 布局的默认键位状态（全部 `is-active`/`is-hint` 为 false），
+    // 分区归属与 Rust 侧 `finger_zone_of` 一一对应，`shift-label` 与 Rust 侧
+    // `domain::shifted_char` 的取值一一对应，供组件独立预览使用。
+    pure function default-key-layout() -> [KeyState] {
+        return [
+            // 数字行
+            { label: "`", zone: FingerZoneId.left-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: "~" },
+            { label: "1", zone: FingerZoneId.left-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: "!" },
+            { label: "2", zone: FingerZoneId.left-ring, is-active: false, is-hint: false, needs-shift: false, shift-label: "@" },
+            { label: "3", zone: FingerZoneId.left-middle, is-active: false, is-hint: false, needs-shift: false, shift-label: "#" },
+            { label: "4", zone: FingerZoneId.left-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "$" },
+            { label: "5", zone: FingerZoneId.left-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "%" },
+            { label: "6", zone: FingerZoneId.right-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "^" },
+            { label: "7", zone: FingerZoneId.right-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "&" },
+            { label: "8", zone: FingerZoneId.right-middle, is-active: false, is-hint: false, needs-shift: false, shift-label: "*" },
+            { label: "9", zone: FingerZoneId.right-ring, is-active: false, is-hint: false, needs-shift: false, shift-label: "(" },
+            { label: "0", zone: FingerZoneId.right-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: ")" },
+            { label: "-", zone: FingerZoneId.right-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: "_" },
+            { label: "=", zone: FingerZoneId.right-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: "+" },
+            // QWERTY 行（字母键没有 Shift 组合字符标签，`shift-label` 留空）
+            { label: "Q", zone: FingerZoneId.left-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "W", zone: FingerZoneId.left-ring, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "E", zone: FingerZoneId.left-middle, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "R", zone: FingerZoneId.left-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "T", zone: FingerZoneId.left-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "Y", zone: FingerZoneId.right-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "U", zone: FingerZoneId.right-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "I", zone: FingerZoneId.right-middle, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "O", zone: FingerZoneId.right-ring, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "P", zone: FingerZoneId.right-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "[", zone: FingerZoneId.right-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: "{" },
+            { label: "]", zone: FingerZoneId.right-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: "}" },
+            { label: "\\", zone: FingerZoneId.right-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: "|" },
+            // ASDF 行
+            { label: "A", zone: FingerZoneId.left-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "S", zone: FingerZoneId.left-ring, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "D", zone: FingerZoneId.left-middle, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "F", zone: FingerZoneId.left-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "G", zone: FingerZoneId.left-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "H", zone: FingerZoneId.right-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "J", zone: FingerZoneId.right-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "K", zone: FingerZoneId.right-middle, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "L", zone: FingerZoneId.right-ring, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: ";", zone: FingerZoneId.right-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: ":" },
+            { label: "'", zone: FingerZoneId.right-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: "\"" },
+            // ZXCV 行
+            { label: "Z", zone: FingerZoneId.left-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "X", zone: FingerZoneId.left-ring, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "C", zone: FingerZoneId.left-middle, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "V", zone: FingerZoneId.left-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "B", zone: FingerZoneId.left-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "N", zone: FingerZoneId.right-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: "M", zone: FingerZoneId.right-index, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+            { label: ",", zone: FingerZoneId.right-middle, is-active: false, is-hint: false, needs-shift: false, shift-label: "<" },
+            { label: ".", zone: FingerZoneId.right-ring, is-active: false, is-hint: false, needs-shift: false, shift-label: ">" },
+            { label: "/", zone: FingerZoneId.right-pinky, is-active: false, is-hint: false, needs-shift: false, shift-label: "?" },
+            // 空格（Rust 侧 `finger_zone_of` 将 Space 归入 LeftThumb，此处保持一致；
+            // 空格没有 Shift 变体，`shift-label` 留空）
+            { label: "Space", zone: FingerZoneId.left-thumb, is-active: false, is-hint: false, needs-shift: false, shift-label: "" },
+        ];
+    }
+
+    // 键盘外壳：把 5 行键帽包进一块固定尺寸的面板里，并在水平方向居中。
+    // 尺寸完全由 `KeyMetrics` 推导，因此调整 `unit`/`gap` 即可整体缩放，
+    // 不需要逐行修改魔法数字。
+    HorizontalLayout {
+        alignment: center;
+
+        Rectangle {
+            width: KeyMetrics.board-width;
+            height: KeyMetrics.board-height;
+            border-radius: Theme.radius-xl;
+            background: Theme.surface-sunken;
+            border-width: 1px;
+            border-color: Theme.border;
+            drop-shadow-blur: 12px;
+            drop-shadow-offset-y: 4px;
+            drop-shadow-color: Theme.shadow;
+
+            VerticalLayout {
+                padding: KeyMetrics.case-padding;
+                spacing: KeyMetrics.gap;
+
+                // 数字行：13 个可练习键（0..12）+ 2u 的 Backspace 补齐到 15u。
+                KeyRow {
+                    for i in 13: KeyButton {
+                        state: key-states[i];
+                        pressed: root.pressed-key-index == i;
+                    }
+                    ChromeKey {
+                        label: "delete";
+                        units: 2.0;
+                    }
+                }
+
+                // QWERTY 行：1.5u Tab + 12 个可练习键（13..24）+ 1.5u 的 `\`。
+                // 注意反斜杠本身是可练习键（索引 25），只是宽度取 1.5u。
+                KeyRow {
+                    ChromeKey {
+                        label: "tab";
+                        units: 1.5;
+                    }
+                    for i in 12: KeyButton {
+                        state: key-states[13 + i];
+                        pressed: root.pressed-key-index == 13 + i;
+                    }
+                    KeyButton {
+                        state: key-states[25];
+                        units: 1.5;
+                        pressed: root.pressed-key-index == 25;
+                    }
+                }
+
+                // ASDF 行：1.75u Caps Lock + 11 个可练习键（26..36）+ 2.25u Enter。
+                KeyRow {
+                    ChromeKey {
+                        label: "caps";
+                        units: 1.75;
+                    }
+                    for i in 11: KeyButton {
+                        state: key-states[26 + i];
+                        pressed: root.pressed-key-index == 26 + i;
+                    }
+                    ChromeKey {
+                        label: "return";
+                        units: 2.25;
+                    }
+                }
+
+                // ZXCV 行：2.25u 左 Shift + 10 个可练习键（37..46）+ 2.75u 右 Shift。
+                KeyRow {
+                    ChromeKey {
+                        label: "shift";
+                        units: 2.25;
+                        highlighted: root.hint-needs-shift;
+                    }
+                    for i in 10: KeyButton {
+                        state: key-states[37 + i];
+                        pressed: root.pressed-key-index == 37 + i;
+                    }
+                    ChromeKey {
+                        label: "shift";
+                        units: 2.75;
+                        highlighted: root.hint-needs-shift;
+                    }
+                }
+
+                // 空格行：4 个 1.25u 修饰键 + 6.25u 空格（索引 47）+ 3 个 1.25u 修饰键。
+                KeyRow {
+                    ChromeKey {
+                        label: "fn";
+                        units: 1.25;
+                    }
+                    ChromeKey {
+                        label: "ctrl";
+                        units: 1.25;
+                    }
+                    ChromeKey {
+                        label: "alt";
+                        units: 1.25;
+                    }
+                    ChromeKey {
+                        label: "cmd";
+                        units: 1.25;
+                    }
+                    KeyButton {
+                        state: key-states[47];
+                        units: 6.25;
+                        pressed: root.pressed-key-index == 47;
+                    }
+                    ChromeKey {
+                        label: "cmd";
+                        units: 1.25;
+                    }
+                    ChromeKey {
+                        label: "alt";
+                        units: 1.25;
+                    }
+                    ChromeKey {
+                        label: "ctrl";
+                        units: 1.25;
+                    }
+                }
+            }
+        }
+    }
+}

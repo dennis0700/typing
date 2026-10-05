@@ -1,0 +1,288 @@
+// 结果统计浮层（Req 4.1, 4.2, 4.4, 4.5）。
+//
+// 本组件仅负责渲染本次练习环节的统计数据（用时、错误数、正确率、打字速度）
+// 以及与历史最佳成绩的比较结果；所有数值计算（`calc_accuracy`/`calc_wpm`/
+// `compare_with_best`）均已在 Rust 侧的 `domain/stats.rs` 完成，本组件不在
+// `.slint` 中编写任何比较或换算逻辑，只按传入属性展示文案与样式
+// （对应 `ComparisonResult` 枚举：`FirstRecord` / `Higher` / `Lower` / `Equal`）。
+//
+// ## 为什么是"浮层"而不是独立页面
+//
+// `AppController::handle_practice_completion()` 返回的命令序列是
+// `[NavigateTo(CurriculumSequence), ShowPracticeResult(..), (ShowToast(..)),
+// ShowRewardFeedback(..)]`——练习完成时先导航回课程序列界面，再叠加展示
+// 结果统计与奖励反馈。因此本组件被设计为"叠加在当前页面之上的浮层"
+// （root 为 100%×100% 的半透明遮罩 + 居中卡片），而不是 `AppPage` 枚举中
+// 的一个新页面。
+//
+// ## 分层约定（与 `reward_overlay.slint`/`toast.slint` 一致）
+//
+// - `active` 决定是否渲染；本组件**不自行修改** `active`。
+// - 孩子点击"继续"按钮时只发出 `dismissed()` 回调，由调用方（`ui.rs`
+//   桥接层）决定"把 `active` 置回 false / 是否还要做别的导航"。本组件
+//   不做任何导航决策。
+//
+// ## 可访问性 / 儿童友好约束（Req 7.1）
+//
+// - "继续"按钮 `min-width: 160px; min-height: 56px`，均不小于 44px。
+// - 卡片内所有 `spacing` 均不小于 8px。
+
+// 与历史最佳成绩的比较方向。Slint 枚举成员使用 kebab-case。
+import { Theme } from "theme.slint";
+
+export enum ComparisonDirection {
+    // 该课程尚不存在历史最佳成绩，不进行比较（Req 4.5）。
+    first-record,
+    // 本次成绩优于历史最佳成绩（Req 4.4）。
+    higher,
+    // 本次成绩劣于历史最佳成绩（Req 4.4）。
+    lower,
+    // 本次成绩与历史最佳成绩完全相等（Req 4.4）。
+    equal,
+}
+
+export component ResultSummary inherits Rectangle {
+    // 是否当前处于展示状态。为 false 时整个浮层不渲染、不占用交互层。
+    in-out property <bool> active: false;
+
+    // 本次练习用时（毫秒），由 Rust 侧 `PracticeResult.duration_ms` 提供。
+    in property <int> duration-ms: 0;
+    // 本次练习错误字符总数，对应 `PracticeResult.error_count`（Req 3.5）。
+    in property <int> error-count: 0;
+    // 本次练习正确率（0.0-100.0，已保留1位小数），对应 `calc_accuracy`
+    // 的返回值（Req 4.1）。
+    in property <float> accuracy: 0.0;
+    // 本次练习打字速度（WPM，已保留1位小数），对应 `calc_wpm` 的返回值
+    // （Req 4.2）。
+    in property <float> wpm: 0.0;
+
+    // 历史最佳成绩比较结果（对应 Rust 侧 `ComparisonResult` 枚举，Req 4.4, 4.5）。
+    in property <ComparisonDirection> comparison-direction: ComparisonDirection.first-record;
+    // 本次正确率相对历史最佳的差值（`current.accuracy - best.accuracy`），
+    // 仅当 `comparison-direction` 为 `higher`/`lower`/`equal` 时有意义。
+    in property <float> accuracy-delta: 0.0;
+    // 本次打字速度相对历史最佳的差值（`current.wpm - best.wpm`），
+    // 仅当 `comparison-direction` 为 `higher`/`lower`/`equal` 时有意义。
+    in property <float> wpm-delta: 0.0;
+
+    // 孩子点击"继续"按钮时触发，通知调用方结果统计浮层应被关闭。
+    // 本组件不自行修改 `active`，也不做任何导航（见上方分层约定）。
+    callback dismissed();
+
+    width: 100%;
+    height: 100%;
+
+    // 半透明遮罩，仅在展示时可见（root 是 `Rectangle` 而非 `TouchArea`，
+    // 不参与命中测试，因此不展示时完全不影响下方页面的交互）。
+    background: root.active ? Theme.overlay : transparent;
+
+    VerticalLayout {
+        alignment: center;
+
+        HorizontalLayout {
+            alignment: center;
+
+            if root.active: Rectangle {
+                width: 520px;
+                background: Theme.background;
+                border-radius: 16px;
+
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 16px;
+                    alignment: start;
+
+                    Text {
+                        text: "练习结果";
+                        font-size: 28px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                    }
+
+                    // 核心统计数据卡片：用时 / 错误数 / 正确率 / 打字速度。
+                    // 每个统计项使用大号文字，满足儿童友好的可读性约定（设计文档
+                    // "Slint 组件与需求的映射"）。
+                    Rectangle {
+                        background: Theme.muted;
+                        border-radius: Theme.radius-lg;
+                        border-width: 1px;
+                        border-color: Theme.border;
+
+                        VerticalLayout {
+                            padding: 20px;
+                            spacing: 12px;
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: space-between;
+
+                                Text {
+                                    text: "用时";
+                                    font-size: 18px;
+                                    color: Theme.muted-foreground;
+                                    vertical-alignment: center;
+                                }
+
+                                Text {
+                                    text: "\{Math.floor(root.duration-ms / 1000)}秒";
+                                    font-size: 22px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: space-between;
+
+                                Text {
+                                    text: "错误数";
+                                    font-size: 18px;
+                                    color: Theme.muted-foreground;
+                                    vertical-alignment: center;
+                                }
+
+                                Text {
+                                    text: "\{root.error-count}个";
+                                    font-size: 22px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: space-between;
+
+                                Text {
+                                    text: "正确率";
+                                    font-size: 18px;
+                                    color: Theme.muted-foreground;
+                                    vertical-alignment: center;
+                                }
+
+                                Text {
+                                    text: "\{Math.round(root.accuracy * 10) / 10}%";
+                                    font-size: 22px;
+                                    font-weight: 700;
+                                    color: Theme.success;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: space-between;
+
+                                Text {
+                                    text: "速度";
+                                    font-size: 18px;
+                                    color: Theme.muted-foreground;
+                                    vertical-alignment: center;
+                                }
+
+                                Text {
+                                    text: "\{Math.round(root.wpm * 10) / 10} WPM";
+                                    font-size: 22px;
+                                    font-weight: 700;
+                                    color: Theme.info;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    // 历史最佳成绩比较结果（Req 4.4, 4.5）。
+                    Rectangle {
+                        background: Theme.muted;
+                        border-radius: Theme.radius-lg;
+                        border-width: 1px;
+                        border-color: Theme.border;
+
+                        VerticalLayout {
+                            padding: 20px;
+                            spacing: 8px;
+
+                            if root.comparison-direction == ComparisonDirection.first-record: Text {
+                                text: "本次为首次记录";
+                                font-size: 20px;
+                                font-weight: 700;
+                                color: Theme.info;
+                                horizontal-alignment: center;
+                            }
+
+                            if root.comparison-direction != ComparisonDirection.first-record: VerticalLayout {
+                                spacing: 8px;
+
+                                Text {
+                                    text: root.comparison-direction == ComparisonDirection.higher ? "比历史最佳更高" : root.comparison-direction == ComparisonDirection.lower ? "比历史最佳更低" : "与历史最佳相同";
+                                    font-size: 20px;
+                                    font-weight: 700;
+                                    color: root.comparison-direction == ComparisonDirection.higher
+                                        ? Theme.success
+                                        : root.comparison-direction == ComparisonDirection.lower
+                                            ? Theme.destructive
+                                            : Theme.muted-foreground;
+                                    horizontal-alignment: center;
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: center;
+
+                                    Text {
+                                        text: "正确率 " + (root.accuracy-delta >= 0 ? "+" : "") + Math.round(root.accuracy-delta * 10) / 10 + "%";
+                                        font-size: 16px;
+                                        color: Theme.muted-foreground;
+                                    }
+
+                                    Text {
+                                        text: "速度 " + (root.wpm-delta >= 0 ? "+" : "") + Math.round(root.wpm-delta * 10) / 10 + " WPM";
+                                        font-size: 16px;
+                                        color: Theme.muted-foreground;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // "继续"按钮（Req 7.1：≥44×44px）。点击后仅发出
+                    // `dismissed()`，由 Rust 侧关闭浮层。
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 8px;
+
+                        continue-button := TouchArea {
+                            min-width: 160px;
+                            min-height: 56px;
+
+                            clicked => {
+                                root.dismissed();
+                            }
+
+                            Rectangle {
+                                width: 100%;
+                                height: 100%;
+                                border-radius: Theme.radius-lg;
+                                background: continue-button.has-hover ? Theme.success-hover : Theme.success;
+
+                                animate background {
+                                    duration: 120ms;
+                                }
+
+                                Text {
+                                    text: "继续";
+                                    font-size: 20px;
+                                    font-weight: 700;
+                                    color: Theme.vivid-foreground;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

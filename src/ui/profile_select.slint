@@ -1,0 +1,532 @@
+// 学员档案选择界面（Req 6.2, 6.4, 6.5, 6.6, 6.7）。
+//
+// 本组件仅负责渲染档案列表、新建档案输入框与错误提示，并将用户交互
+// 转发为回调事件；不在 `.slint` 中编写昵称校验/数量上限等业务判断逻辑
+// ——这些判断由 Rust 侧的 `ProfileManager`/`validate_nickname` 完成
+// （任务 18.8 桥接层负责将 `select-profile`/`create-profile` 回调转换为
+// `AppEvent::SelectProfile`/`AppEvent::CreateProfile` 并派发给
+// `AppController::dispatch`）。
+
+// 档案选择界面所需的最小档案信息（对应 Rust 侧 `ProfileSummary`）。
+// Slint 组件树内没有 Rust 结构体，这里用 `struct` 定义等价的可序列化形式：
+// `profile-id` 使用 UUID 的字符串形式，便于跨 FFI 边界传递。
+import { Theme } from "theme.slint";
+import { LineEdit } from "std-widgets.slint";
+
+export struct ProfileSummary {
+    profile-id: string,
+    nickname: string,
+}
+
+// 当前正在二次确认的档案管理操作（Req 6.9）。
+//
+// 为什么把"待确认的操作"做成本组件内部的状态而不是 Rust 侧状态：二次确认
+// 纯粹是一次 UI 交互过程，用户在弹窗里点"取消"时**不应该有任何事件到达
+// Rust 侧**（Req 6.10：取消不得修改任何数据）。把它放在 `.slint` 内，
+// `AppController` 就只会在用户明确确认后收到一个已决事件，状态机里不需要
+// 存在任何"待确认"中间态。
+export enum ProfileManagementAction {
+    // 没有待确认的操作，弹窗不显示。
+    none,
+    delete,
+    reset,
+    rename,
+}
+
+component ManageButton inherits Rectangle {
+    in property <string> label;
+    in property <color> base-color;
+    in property <color> hover-color;
+    // 文字色单独可配：shadcn 的按钮变体里只有 destructive/primary 是"实心底
+    // + 浅色字"，secondary 是"浅底 + 深色字"，两者的文字色不同。
+    in property <color> label-color: Theme.vivid-foreground;
+    // 次要按钮需要描边才能在浅底卡片上看出边界（shadcn secondary/outline）。
+    in property <bool> outlined: false;
+    callback clicked();
+
+    // ≥44×44px 最小可点击区域（Req 7.1）。
+    min-width: 56px;
+    min-height: 44px;
+    border-radius: Theme.radius-sm;
+    border-width: root.outlined ? 1px : 0px;
+    border-color: Theme.border;
+    background: touch.has-hover ? root.hover-color : root.base-color;
+
+    animate background {
+        duration: 120ms;
+    }
+
+    touch := TouchArea {
+        width: 100%;
+        height: 100%;
+
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    Text {
+        text: root.label;
+        color: root.label-color;
+        font-size: 14px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component ProfileSelectPage inherits Rectangle {
+    // 已创建的学员档案列表（Req 6.2：启动时列出所有已创建档案及其昵称）。
+    in property <[ProfileSummary]> profiles: [];
+    // 新建档案昵称校验失败时展示的错误提示文案（Req 6.5, 6.7）；
+    // 为空字符串时不显示错误提示区域。
+    in property <string> nickname-error: "";
+
+    // 用户点击某个已存在档案时触发，携带该档案的 `profile-id`（Req 6.4）。
+    callback select-profile(string);
+    // 用户点击"新建档案"按钮时触发（或在昵称输入框内按回车），携带输入框中
+    // 的昵称文本（Req 6.5, 6.6, 6.7）。
+    callback create-profile(string);
+    // 以下三个档案管理回调都只在用户于二次确认弹窗中点击"确定"后才触发
+    // （Req 6.9, 6.10）——点"取消"只是关闭弹窗，不发出任何回调。
+    callback delete-profile(string);
+    callback reset-profile-progress(string);
+    callback rename-profile(string, string);
+
+    // 待二次确认的操作及其目标档案。`pending-action` 为 `none` 时弹窗不存在。
+    private property <ProfileManagementAction> pending-action: ProfileManagementAction.none;
+    private property <string> pending-profile-id: "";
+    private property <string> pending-nickname: "";
+    // 重命名输入框的当前内容。必须提到页面级：输入框声明在 `if` 条件元素
+    // 内部，其 id 的作用域仅限该条件块，弹窗底部的"确定"按钮无法直接引用它
+    // （Slint 会报 "Cannot access id"）。因此由输入框在 `edited` 时把内容
+    // 同步到这里，按钮只读这个属性。
+    private property <string> rename-input-text: "";
+
+    function open-dialog(action: ProfileManagementAction, profile-id: string, nickname: string) {
+        self.pending-action = action;
+        self.pending-profile-id = profile-id;
+        self.pending-nickname = nickname;
+        // 预填当前昵称：用户不做任何修改直接点"确认改名"时，提交的就是原
+        // 昵称（`rename_profile` 的重复判定排除自身，因此这是合法的空操作）。
+        self.rename-input-text = nickname;
+    }
+
+    function close-dialog() {
+        self.pending-action = ProfileManagementAction.none;
+        self.pending-profile-id = "";
+        self.pending-nickname = "";
+        self.rename-input-text = "";
+    }
+
+    // 档案卡片的固定高度与卡片间距。
+    //
+    // 为什么必须是"确定的固定值"而不是让布局自行推导：
+    // `Flickable` 内部一旦包含 repeater（`for ... in ...` 生成的元素），
+    // Slint 无法从被重复的元素推导出 viewport 的尺寸约束
+    // （slint-ui/slint#407），而"由布局自动设置 flickable 的
+    // viewport-width/viewport-height"至今仍是未实现的功能诉求
+    // （slint-ui/slint#178）。因此卡片高度必须是一个确定的具名常量，
+    // 下方 `viewport-height` 才能按「条目数 × (卡片高度 + 间距)」算出
+    // 真实内容高度。请勿把这两个常量或 `viewport-*` 的显式赋值当作
+    // 冗余代码"清理"掉——去掉后档案列表会因 viewport 高度为 0 而不可见。
+    // 卡片高度 72px：卡片内除昵称外还要横向容纳三个 ≥44px 高的管理按钮
+    // （Req 6.8），加上 12px 的上下内边距正好是 44 + 24 = 68 < 72。
+    private property <length> card-height: 72px;
+    private property <length> card-spacing: 8px;
+
+    background: Theme.muted;
+
+    // 外层布局**不能**写 `alignment: start`：Slint 中 alignment 一旦不是
+    // 默认的 `stretch`，布局就不再把剩余空间分配给子元素，`*-stretch`
+    // 因子会被完全忽略。那样下方 `Rectangle { vertical-stretch: 1 }` 只能
+    // 拿到自身的首选高度，而它内部唯一的子元素是 `Flickable`
+    // （Flickable 不会把 viewport 尺寸上报为自己的首选尺寸），首选高度即 0
+    // → `Flickable { height: 100% }` 也是 0 → 档案列表整体不可见。
+    // 因此这里保持默认的 stretch 语义，并显式把"不应吃掉剩余空间"的子元素
+    // 标为 `vertical-stretch: 0`。
+    VerticalLayout {
+        padding: 24px;
+        spacing: 16px;
+
+        Text {
+            // 标题按首选高度渲染，不参与剩余空间分配。
+            vertical-stretch: 0;
+            text: "选择学员档案";
+            font-size: 24px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+
+        // 档案列表：每个档案渲染为一个可点击卡片/行，满足最小触摸目标
+        // （≥44×44px）与相邻控件间距（≥8px）约定（设计文档"Slint 组件与
+        // 需求的映射"表，Req 7.1）。
+        //
+        // 本页唯一吃掉剩余竖直空间的元素，Flickable 的 `height: 100%`
+        // 依赖它拿到非 0 高度。
+        Rectangle {
+            vertical-stretch: 1;
+
+            profile-list := Flickable {
+                width: 100%;
+                height: 100%;
+
+                // 显式给出 viewport 尺寸：repeater 生成的卡片无法参与
+                // viewport 尺寸推导（见组件顶部 card-height 注释中的
+                // slint-ui/slint#407 / #178），所以内容高度必须由
+                // 「条目数 × (卡片高度 + 卡片间距)」显式算出，否则列表塌陷。
+                viewport-width: self.width;
+                viewport-height: root.profiles.length * (root.card-height + root.card-spacing);
+
+                VerticalLayout {
+                    spacing: 8px;
+                    // 这一层的 `alignment: start` 必须**保留**：它让卡片按
+                    // 各自的首选高度（card-height）从顶部依次排布、不被拉伸
+                    // 平分 viewport 高度。与外层布局不同，这里正是想要
+                    // "不分配剩余空间"的语义。
+                    alignment: start;
+
+                    // 卡片本身是普通 `Rectangle`，**不是** `TouchArea`：
+                    // "点卡片选择该档案"与"点管理按钮"必须是两个互不重叠的
+                    // 命中区域。若把整张卡片做成 TouchArea 再把按钮嵌在里面，
+                    // 就要依赖"内层 TouchArea 一定优先于外层"这一隐式行为；
+                    // 一旦不成立，点"删除"会同时选中该档案并跳转到课程序列
+                    // 界面，确认弹窗则显示在错误的页面上。这里改为把卡片横向
+                    // 切成"选择区 + 管理按钮区"两块并列的命中区域，语义无歧义。
+                    for profile[i] in root.profiles: Rectangle {
+                        // 卡片高度取确定的具名常量而非交给布局推导（见上方
+                        // viewport 注释）。这里用 `min-height` 而非 `height`：
+                        // Slint 不允许在同一元素上同时指定 `height` 与
+                        // `min-height`，而 `min-height` 同时承担"固定高度"
+                        // 与"≥44px 最小可点击区域"（Req 7.1）两重职责。
+                        min-height: root.card-height;
+                        // 悬停时换底色（`Theme.card-hover`，浅蓝）。不能用
+                        // `Theme.accent`——它与 `Theme.muted` 同值，会被误读成
+                        // 灰色的禁用态，详见 `theme.slint` 中 `card-hover` 的说明。
+                        background: select-area.has-hover ? Theme.card-hover : Theme.card;
+                        border-radius: Theme.radius;
+                        border-width: 1px;
+                        border-color: Theme.border;
+
+                        animate background {
+                            duration: 120ms;
+                        }
+
+                        HorizontalLayout {
+                            padding: 12px;
+                            spacing: 8px;
+
+                            // 选择区：占据除管理按钮外的全部宽度，点击即选择
+                            // 该档案进入课程序列界面（Req 6.4）。
+                            select-area := TouchArea {
+                                horizontal-stretch: 1;
+
+                                clicked => {
+                                    root.select-profile(profile.profile-id);
+                                }
+
+                                Text {
+                                    text: profile.nickname;
+                                    font-size: 16px;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            // 管理操作入口（Req 6.8）。三者都不直接执行操作，
+                            // 只是打开对应的二次确认弹窗（Req 6.9）。
+                            ManageButton {
+                                label: "改名";
+                                base-color: Theme.secondary;
+                                hover-color: Theme.secondary-hover;
+                                label-color: Theme.secondary-foreground;
+                                outlined: true;
+                                clicked => {
+                                    root.open-dialog(
+                                        ProfileManagementAction.rename,
+                                        profile.profile-id,
+                                        profile.nickname,
+                                    );
+                                }
+                            }
+
+                            ManageButton {
+                                label: "重置";
+                                base-color: Theme.warning;
+                                hover-color: Theme.warning-hover;
+                                clicked => {
+                                    root.open-dialog(
+                                        ProfileManagementAction.reset,
+                                        profile.profile-id,
+                                        profile.nickname,
+                                    );
+                                }
+                            }
+
+                            ManageButton {
+                                label: "删除";
+                                base-color: Theme.destructive;
+                                hover-color: Theme.destructive-hover;
+                                clicked => {
+                                    root.open-dialog(
+                                        ProfileManagementAction.delete,
+                                        profile.profile-id,
+                                        profile.nickname,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 新建档案区域：昵称输入框 + 创建按钮，二者之间保持 ≥8px 间距，
+        // 按钮满足 ≥44×44px 最小可点击区域约定（Req 7.1）。
+        Rectangle {
+            // 按内容首选高度渲染，不参与剩余空间分配——否则这块区域会与
+            // 上方列表容器一起平分剩余高度，输入框/按钮被拉得很高变形。
+            vertical-stretch: 0;
+            background: Theme.card;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: Theme.border;
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 8px;
+
+                Text {
+                    text: "新建档案";
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    nickname-input := LineEdit {
+                        min-height: 44px;
+                        horizontal-stretch: 1;
+                        placeholder-text: "输入昵称（最多20个字符）";
+
+                        // 回车提交（Req 6.5）：`LineEdit` 的 `accepted` 回调
+                        // 在按下回车时触发，这里与"创建"按钮的 `clicked`
+                        // 走完全相同的一条路径（同样只是转发
+                        // `root.create-profile(...)`，昵称校验仍在 Rust 侧），
+                        // 让孩子输完名字直接回车即可，不必精确点到按钮。
+                        accepted => {
+                            root.create-profile(self.text);
+                        }
+                    }
+
+                    create-button := TouchArea {
+                        min-width: 88px;
+                        min-height: 44px;
+
+                        clicked => {
+                            root.create-profile(nickname-input.text);
+                        }
+
+                        Rectangle {
+                            background: create-button.has-hover ? Theme.success-hover : Theme.success;
+                            border-radius: Theme.radius;
+
+                            Text {
+                                text: "创建";
+                                color: Theme.vivid-foreground;
+                                font-size: 16px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                // 错误提示（Req 6.5, 6.7）：昵称为空/超长/重复时由 Rust 侧
+                // 填充 `nickname-error`；输入框内容不会被清空（由调用方保留）。
+                if root.nickname-error != "": Text {
+                    text: root.nickname-error;
+                    color: Theme.destructive;
+                    font-size: 13px;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 档案管理的二次确认弹窗（Req 6.9, 6.10）
+    // ------------------------------------------------------------------
+    //
+    // 声明在页面主体布局**之后**，因此绘制在其上方，构成浮层。整块只在
+    // `pending-action != none` 时存在：关闭时元素被销毁，既不参与命中测试也
+    // 不占布局空间，不会影响下方页面的交互。
+    if root.pending-action != ProfileManagementAction.none: Rectangle {
+        width: 100%;
+        height: 100%;
+        background: Theme.overlay;
+
+        // 遮罩层：吞掉落在弹窗之外的点击，避免用户在确认过程中误触下方的
+        // 档案卡片/创建按钮。**刻意不实现"点遮罩即取消"**——删除与重置是
+        // 不可撤销操作，关闭它们的确认弹窗应当是一次明确的"取消"点击，
+        // 而不是一次可能出于误触的空白处点击。
+        TouchArea {
+            width: 100%;
+            height: 100%;
+        }
+
+        VerticalLayout {
+            alignment: center;
+
+            HorizontalLayout {
+                alignment: center;
+
+                Rectangle {
+                    width: 460px;
+                    background: Theme.popover;
+                    border-radius: Theme.radius-xl;
+                    border-width: 2px;
+                    border-color: root.pending-action == ProfileManagementAction.delete
+                        ? Theme.destructive
+                        : root.pending-action == ProfileManagementAction.reset
+                            ? Theme.warning
+                            : Theme.success;
+
+                    VerticalLayout {
+                        padding: 24px;
+                        spacing: 16px;
+
+                        Text {
+                            text: root.pending-action == ProfileManagementAction.delete
+                                ? "删除「" + root.pending-nickname + "」？"
+                                : root.pending-action == ProfileManagementAction.reset
+                                    ? "重置「" + root.pending-nickname + "」的学习进度？"
+                                    : "重命名「" + root.pending-nickname + "」";
+                            font-size: 20px;
+                            font-weight: 700;
+                            color: Theme.popover-foreground;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+
+                        // 影响说明：明确告知该操作会删掉什么、是否可撤销
+                        // （Req 6.9 要求二次确认说明影响与不可撤销性）。
+                        Text {
+                            text: root.pending-action == ProfileManagementAction.delete
+                                ? "该学员的昵称、学习进度与全部练习记录都会被永久删除，无法恢复。删除后可以再新建学员档案。"
+                                : root.pending-action == ProfileManagementAction.reset
+                                    ? "该学员的课程解锁状态与练习记录会回到刚新建档案时的样子，无法恢复。昵称会保留。"
+                                    : "只修改昵称，学习进度与练习记录保持不变。昵称需要非空且不超过 20 个字符，且不能与其他学员重复。";
+                            font-size: 14px;
+                            color: Theme.muted-foreground;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+
+                        if root.pending-action == ProfileManagementAction.rename: LineEdit {
+                            min-height: 44px;
+                            placeholder-text: "输入新昵称（最多20个字符）";
+
+                            // 打开弹窗时预填当前昵称：用 `init` 一次性赋值而
+                            // 不是给 `text` 绑定表达式，避免绑定在用户编辑后
+                            // 又被重新求值覆盖掉输入内容。
+                            init => {
+                                self.text = root.rename-input-text;
+                            }
+
+                            // 把输入内容同步给页面级属性，供"确认改名"按钮读取。
+                            edited => {
+                                root.rename-input-text = self.text;
+                            }
+
+                            // 回车提交，与"确定"按钮同一条路径。
+                            accepted => {
+                                root.rename-profile(root.pending-profile-id, self.text);
+                                root.close-dialog();
+                            }
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 16px;
+
+                            cancel-button := TouchArea {
+                                min-width: 120px;
+                                min-height: 48px;
+
+                                // Req 6.10：取消只关闭弹窗，不发出任何回调，
+                                // 因此 Rust 侧不会收到事件、数据不会被修改。
+                                clicked => {
+                                    root.close-dialog();
+                                }
+
+                                Rectangle {
+                                    width: 100%;
+                                    height: 100%;
+                                    border-radius: Theme.radius-lg;
+                                    background: cancel-button.has-hover ? Theme.secondary-hover : Theme.secondary;
+
+                                    animate background {
+                                        duration: 120ms;
+                                    }
+
+                                    Text {
+                                        text: "取消";
+                                        font-size: 16px;
+                                        font-weight: 700;
+                                        color: Theme.secondary-foreground;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+
+                            confirm-button := TouchArea {
+                                min-width: 120px;
+                                min-height: 48px;
+
+                                clicked => {
+                                    if (root.pending-action == ProfileManagementAction.delete) {
+                                        root.delete-profile(root.pending-profile-id);
+                                    } else if (root.pending-action == ProfileManagementAction.reset) {
+                                        root.reset-profile-progress(root.pending-profile-id);
+                                    } else {
+                                        root.rename-profile(root.pending-profile-id, root.rename-input-text);
+                                    }
+                                    root.close-dialog();
+                                }
+
+                                Rectangle {
+                                    width: 100%;
+                                    height: 100%;
+                                    border-radius: Theme.radius-lg;
+                                    background: root.pending-action == ProfileManagementAction.delete
+                                        ? (confirm-button.has-hover ? Theme.destructive-hover : Theme.destructive)
+                                        : root.pending-action == ProfileManagementAction.reset
+                                            ? (confirm-button.has-hover ? Theme.warning-hover : Theme.warning)
+                                            : (confirm-button.has-hover ? Theme.success-hover : Theme.success);
+
+                                    animate background {
+                                        duration: 120ms;
+                                    }
+
+                                    Text {
+                                        text: root.pending-action == ProfileManagementAction.delete
+                                            ? "确认删除"
+                                            : root.pending-action == ProfileManagementAction.reset
+                                                ? "确认重置"
+                                                : "确认改名";
+                                        font-size: 16px;
+                                        font-weight: 700;
+                                        color: Theme.vivid-foreground;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

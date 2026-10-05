@@ -1,0 +1,124 @@
+// 「展示正确答案」提示浮层（Req 7.6）。
+//
+// 承载 `UiCommand::ShowCorrectAnswer`：学员在同一练习题目中连续输入错误
+// 达到 5 次（`domain::SHOW_ANSWER_THRESHOLD`）时，展示正确答案或提示，
+// **并允许学员选择继续下一题目**。
+//
+// 为什么不复用 `toast.slint` 的 `Toast`：
+// Req 7.6 与 Req 7.2（鼓励性提示，用 `Toast` 承载）的关键差异在于本提示
+// 需要一个显式的用户选择入口（"继续下一题"），因此它不能是"若干秒后自动
+// 消失"的被动提示，而必须停留在界面上等待学员点击。带可点击控件的浮层与
+// 纯文本 Toast 的交互语义不同（前者要满足 Req 7.1 的最小可点击目标约束、
+// 要遮挡下方内容以聚焦注意力），拆成两个组件比给 `Toast` 塞一个可选按钮
+// 更清晰。
+//
+// 分层约定（与 `reward_overlay.slint`/`toast.slint` 一致）：
+// 1. 本组件不做任何业务判断：连续错误次数的统计与阈值判定
+//    （`domain::check_error_threshold`）、正确答案文本的提取，全部在 Rust
+//    侧完成，本组件只渲染传入的 `message`/`answer-text`。
+// 2. 本组件不修改自己的可见状态：`message` 是唯一的可见性来源（非空即
+//    可见）。点击"继续下一题"只发出 `continue-requested()` 回调，由 Rust
+//    侧决定"清空提示文案 + 派发 `AppEvent::SkipCurrentItem`"，本组件不
+//    自行隐藏、不做任何导航。
+//
+// 可访问性 / 儿童友好约束（Req 7.1）：
+// - "继续下一题"按钮 `min-width: 160px; min-height: 56px`，均不小于 44px。
+// - 卡片内各元素纵向间距 16px、按钮所在行 `spacing: 8px`，均不小于 8px。
+
+import { Theme } from "theme.slint";
+
+export component AnswerHint inherits Rectangle {
+    // 提示文案（由 Rust 侧 `UiCommand::ShowCorrectAnswer` 携带）。
+    // 非空时浮层可见，空字符串时完全不渲染。
+    in property <string> message: "";
+
+    // 正确答案本身（当前待输入的字符）。空字符串时不渲染答案行——例如
+    // 练习文本已全部输入完毕、没有"下一个待输入字符"可展示的边界情况。
+    in property <string> answer-text: "";
+
+    // 学员点击"继续下一题"时触发。调用方（`ui.rs` 桥接层）应据此清空
+    // `message` 并派发 `AppEvent::SkipCurrentItem`。
+    callback continue-requested();
+
+    property <bool> shown: root.message != "";
+
+    width: 100%;
+    height: 100%;
+
+    // 半透明遮罩：仅在展示时可见，用于把孩子的注意力聚焦到提示卡片上。
+    // root 是 `Rectangle` 而不是 `TouchArea`，不参与命中测试，因此不展示
+    // 时完全不影响下方页面的交互。
+    background: root.shown ? Theme.overlay : transparent;
+
+    VerticalLayout {
+        alignment: center;
+
+        HorizontalLayout {
+            alignment: center;
+
+            if root.shown: Rectangle {
+                width: 480px;
+                background: Theme.popover;
+                border-radius: Theme.radius-xl;
+                border-width: 2px;
+                border-color: Theme.warning;
+
+                VerticalLayout {
+                    padding: 24px;
+                    spacing: 16px;
+
+                    Text {
+                        text: root.message;
+                        font-size: 22px;
+                        font-weight: 700;
+                        color: Theme.warning-foreground-strong;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+
+                    if root.answer-text != "": Text {
+                        text: "正确答案：" + root.answer-text;
+                        font-size: 32px;
+                        font-weight: 700;
+                        color: Theme.warning-foreground;
+                        horizontal-alignment: center;
+                    }
+
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 8px;
+
+                        continue-button := TouchArea {
+                            min-width: 160px;
+                            min-height: 56px;
+
+                            clicked => {
+                                root.continue-requested();
+                            }
+
+                            Rectangle {
+                                width: 100%;
+                                height: 100%;
+                                border-radius: Theme.radius-lg;
+                                background: continue-button.has-hover ? Theme.warning-hover : Theme.warning;
+
+                                animate background {
+                                    duration: 120ms;
+                                }
+
+                                Text {
+                                    text: "继续下一题";
+                                    font-size: 20px;
+                                    font-weight: 700;
+                                    color: Theme.vivid-foreground;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

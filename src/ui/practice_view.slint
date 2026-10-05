@@ -1,0 +1,384 @@
+// 练习环节界面（Req 3.4, 3.7, 7.1, 7.4）。
+//
+// 本组件仅负责按字符状态渲染练习文本的视觉样式、展示已用时长、提供固定
+// 锚点的退出按钮，并组合渲染虚拟键盘；不在 `.slint` 中编写任何业务逻辑
+// ——与 curriculum_map.slint/virtual_keyboard.slint 一致的分层原则：
+//
+// 1. 字符状态到视觉样式的映射：Rust 侧 `domain::typing_match::CharState`
+//    （Pending/Correct/Error）与 `char_state_at`/`char_state_style_token`
+//    已经完成了"某个字符位置当前是什么状态"以及"该状态对应什么样式
+//    token"的计算与判定（Req 3.4）。本组件不重新实现这套判定逻辑，也不
+//    在 `.slint` 内做 `cursor`/`error_count` 相关的算术——调用方（未来
+//    `ui.rs` 桥接层，任务 18.8）应把每个字符位置已经计算好的状态，以
+//    `PracticeCharState` 枚举 + `PracticeCharView` 数组的形式一次性传入，
+//    本组件只做"枚举取值 -> 颜色/样式"的纯渲染映射，与
+//    `FingerZoneColors.color-of` 的角色完全类似。
+//
+// 2. 已用时长的显示：Req 3.7 要求"练习环节进行中持续显示已用时长"，但
+//    真实的时长计算（`app_state::practice_state::PracticeState::elapsed`）
+//    发生在 Rust 侧，基于 `Instant` 计时，`.slint` 侧无法也不应该重新
+//    实现计时逻辑。本组件通过一个 `Timer` 周期性触发 `poll-elapsed()`
+//    回调，通知调用方"该刷新已用时长显示了"；调用方在回调中重新读取
+//    Rust 侧的 `elapsed()` 并把格式化好的 `elapsed-display: string`
+//    写回本组件的输入属性。也就是说，本组件里的 `Timer` 只承担"定期
+//    请求刷新"的职责，不参与任何时长的计算——这与 `reward_overlay.slint`
+//    中 `Timer` 用于控制展示时长（而不是计算业务时长）的角色是同一类
+//    设计取舍。
+//
+// 3. 退出按钮：Req 7.4 要求练习环节界面提供固定位置、尺寸不小于
+//    44×44px 的退出按钮；本组件将其锚定在右上角固定位置，点击时仅
+//    发出 `exit-requested()` 回调，不在 `.slint` 内决定"退出后应该导航
+//    到哪里"或"如何保存进度"——这些由 Rust 侧
+//    `PracticeState::exit`/`AppController::dispatch`（任务 18.8）处理
+//    （Req 7.5）。
+//
+// 4. 虚拟键盘：直接复用 `virtual_keyboard.slint` 导出的 `VirtualKeyboard`
+//    组件，通过 `key-states: [KeyState]` 透传属性一次性传入按键状态数组，
+//    本组件不重复定义按键渲染逻辑。
+//
+// 5. 物理键盘输入捕获（Req 3.2, 3.3, 3.6、2.4, 2.5）：本组件内的
+//    `key-scope := FocusScope` 是整个应用中**唯一**的物理键盘事件入口。
+//    它只做一件事：把 `KeyEvent.text` **原样**通过 `char-input(string)`
+//    回调上抛，然后返回 `accept`（练习界面期望吞掉按键，不让它继续冒泡
+//    到父元素/窗口）。
+//
+//    这里**刻意不在 `.slint` 内做任何字符过滤或正确性判定**：哪些
+//    `event.text` 算"练习输入"（Slint 会把 Esc/Backspace/方向键等非打印键
+//    映射为控制字符或 Unicode 私用区字符 U+E000..U+F8FF）由 Rust 侧的
+//    纯函数 `ui::practice_input_char` 判定；是否与练习文本的待输入字符
+//    一致、错误如何计数、连续错误是否触发提示，由
+//    `domain::apply_input`/`AppController::handle_char_input` 判定。
+//    这与上面第 1 条"字符状态判定不在 `.slint` 侧"的原则一致，同时让过滤
+//    规则可以在 `cargo test` 中单测（Slint 窗口需主线程，无法在测试里
+//    实例化）。
+//
+// 6. 焦点方案：练习界面一出现就必须能直接打字（不能要求孩子先点一下窗口）。
+//    采用「`init` 主动取焦点 + 组件根 `forward-focus` 兜底」的组合：
+//    a. 本组件根上写 `forward-focus: key-scope;`——任何把焦点交给
+//       `PracticeView` 这个组件根的路径（父级 `forward-focus`、Tab 导航）
+//       都会被转发到 `key-scope`；
+//    b. `init => { key-scope.focus(); }`——`app.slint` 中的练习界面是
+//       `if current-page == AppPage.practice-view:` 条件元素，每次导航进入
+//       练习环节时都会被重新实例化并触发 `init`，因此这是"进入练习环节即
+//       获得键盘焦点"的实际生效路径（仅靠 `AppWindow` 上的 `forward-focus`
+//       做不到这一点：条件元素在窗口创建时并不存在，也无法在窗口作用域内
+//       按 id 引用）。
+//    c. `key-scope` 显式设 `focus-on-click: false`：本组件右上角的退出按钮
+//       是一个 `TouchArea`（第 3 条），若 `FocusScope` 也参与点击取焦点，
+//       二者会争夺同一次点击（Slint 社区已知问题）。关掉点击取焦点后，
+//       点击事件完整地交给 `TouchArea`，键盘焦点则始终由上面 a/b 两条
+//       持有，互不干扰。
+
+import { Theme } from "theme.slint";
+import { VirtualKeyboard, KeyState, KeyMetrics } from "virtual_keyboard.slint";
+
+// 单个字符位置的显示状态，与 Rust 侧 `domain::typing_match::CharState`
+// 一一对应（Slint 枚举成员使用 kebab-case）。本组件不定义
+// `char_state_style_token` 的等价函数——样式映射直接内联在
+// `PracticeCharCell` 组件中，与 `virtual_keyboard.slint` 中
+// `FingerZoneColors.color-of` 承担的角色相同：视觉样式的唯一权威定义
+// 留在 `.slint` 侧，调用方只需给出状态枚举本身。
+export enum PracticeCharState {
+    // 尚未输入（对应 Rust `CharState::Pending`）。
+    pending,
+    // 已正确输入（对应 Rust `CharState::Correct`）。
+    correct,
+    // 当前标记为错误，等待学员重新输入（对应 Rust `CharState::Error`）。
+    error,
+}
+
+// 练习文本中单个字符位置的最小视图模型：字符文本 + 该位置的显示状态。
+// `state` 的计算（`char_state_at` 遍历练习文本每个位置得出）完全由 Rust
+// 侧调用方完成，本组件只按 `state` 分支渲染对应样式。
+export struct PracticeCharView {
+    ch: string,
+    state: PracticeCharState,
+}
+
+// 单个字符格：按 `state` 渲染背景色/文字色，三态样式两两可区分
+// （Req 3.4：错误的视觉样式与正确的视觉样式不同）。
+component PracticeCharCell inherits Rectangle {
+    in property <PracticeCharView> view;
+
+    width: 28px;
+    height: 36px;
+    border-radius: 4px;
+
+    background: view.state == PracticeCharState.correct ? Theme.char-correct-bg
+        : view.state == PracticeCharState.error ? Theme.char-error-bg
+        : Theme.char-pending-bg;
+
+    animate background {
+        duration: 120ms;
+    }
+
+    Text {
+        text: view.ch;
+        font-size: 30px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        color: view.state == PracticeCharState.correct ? Theme.char-correct-fg
+            : view.state == PracticeCharState.error ? Theme.char-error-fg
+            : Theme.char-pending-fg;
+    }
+}
+
+export component PracticeView inherits Rectangle {
+    // 练习文本按字符位置展开的视图模型数组（Req 3.4），由 Rust 侧调用方
+    // 遍历 `TypingMatchState` 的每个字符位置调用 `char_state_at` 计算得出。
+    in property <[PracticeCharView]> chars: [];
+
+    // 当前待输入字符在 `chars` 中的下标（Rust 侧 `TypingMatchState::cursor`）。
+    // 本组件只用它做一件纯视觉的事：文本折行后计算光标所在行，并把该行滚动
+    // 到可见区域内（长文本超过可见行数时）。任何"输入是否正确/光标该不该
+    // 前进"的判定仍然只发生在 Rust 侧。
+    in property <int> cursor: 0;
+
+    // ---- 练习文本折行的几何度量（纯坐标换算，见 text-area 处的说明） ----
+    //
+    // 字符格尺寸必须是本组件可见的具名常量，`chars-per-row` 才能从可用宽度
+    // 反算出每行容量；因此 `PracticeCharCell` 的 width/height 也绑定到这两个
+    // 常量，避免两处数字各自漂移。
+    private property <length> char-cell-width: 40px;
+    private property <length> char-cell-height: 52px;
+    private property <length> char-cell-gap: 6px;
+    // 相邻列/行的中心距（格子尺寸 + 间隙）。
+    private property <length> char-column-pitch: char-cell-width + char-cell-gap;
+    private property <length> char-row-pitch: char-cell-height + char-cell-gap;
+
+    // 每行可放的字符格数：n 个格子占 n * pitch - gap 的宽度，故
+    // n = floor((可用宽度 + gap) / pitch)；至少 1，避免窗口被拖到极窄时除零。
+    //
+    // 可用宽度取 `KeyMetrics.board-width`（虚拟键盘外壳宽度）而不是窗口宽度：
+    // 练习文本区与下方键盘视觉宽度保持一致，是与"练习文本区应与键盘同宽"
+    // 一致的布局约束（见下方 `text-area` 的 `width` 绑定）。
+    private property <int> chars-per-row: max(1, floor((KeyMetrics.board-width + char-cell-gap) / char-column-pitch));
+    private property <int> char-row-count: max(1, ceil(chars.length / chars-per-row));
+    // 可见行数：恒为 1——练习文本区一次只展示当前正在输入的这一行，随着
+    // 学员逐字输入、光标越过本行最后一个字符，`first-visible-char-row` 会
+    // 立即前进到下一行，`viewport-y` 跟随滚动到该行（见下方绑定），视觉上
+    // 呈现"打完一行自动换下一行"的效果，而不是像此前那样一次性铺开多行、
+    // 只在光标接近底部时才滚动。
+    private property <int> visible-char-rows: 1;
+    private property <int> cursor-char-row: floor(min(cursor, max(0, chars.length - 1)) / chars-per-row);
+    // 需要滚动时把光标行顶到可见区域底部；同时不越过内容末尾。
+    private property <int> first-visible-char-row: max(0, min(cursor-char-row - visible-char-rows + 1, char-row-count - visible-char-rows));
+
+    // 已用时长的显示文本（Req 3.7），由调用方在 `poll-elapsed` 回调中
+    // 根据 Rust 侧 `PracticeState::elapsed()` 格式化后写回；本组件自身
+    // 不做时长的换算/格式化。
+    in property <string> elapsed-display: "00:00";
+
+    // 虚拟键盘按键状态透传属性，原样转发给 `VirtualKeyboard`
+    // （与 `default-key-layout()` 的默认值保持一致的透传约定）。
+    in property <[KeyState]> key-states: [];
+
+    // 当前提示键位是否需要按住 Shift，原样转发给 `VirtualKeyboard`
+    // （驱动左右 Shift 键的高亮，见 `virtual_keyboard.slint` 中
+    // `hint-needs-shift` 的说明）。
+    in property <bool> hint-needs-shift: false;
+
+    // 当前被按下的键位下标（敲击动画），双向绑定到窗口级属性：Rust 侧写入，
+    // 虚拟键盘内的回弹计时器写回 -1。
+    in-out property <int> pressed-key-index: -1;
+
+    // Timer 触发时发出，通知调用方重新读取 Rust 侧已用时长并刷新
+    // `elapsed-display`；本组件不在回调中自行计算或猜测新的时长值。
+    callback poll-elapsed();
+
+    // 学员点击退出按钮时发出；不携带任何"是否允许退出"的判断——
+    // 退出总是被转发，保存进度与导航均由调用方处理（Req 7.5）。
+    callback exit-requested();
+
+    // 物理键盘按下一个键时发出，参数是 Slint `KeyEvent.text` 的**原始值**
+    // （Req 3.2, 3.3, 3.6）。本组件不判断它是否是有效的练习输入字符——
+    // 过滤规则见 Rust 侧 `ui::practice_input_char`（模块顶部第 5 条）。
+    callback char-input(string);
+
+    background: Theme.background;
+
+    // 见模块顶部第 6 条：任何交给 `PracticeView` 组件根的焦点都转发给
+    // 唯一的键盘事件入口 `key-scope`。
+    forward-focus: key-scope;
+
+    // 已用时长刷新计时器：每秒触发一次 `poll-elapsed()`。1 秒的刷新间隔
+    // 对于"持续显示已用时长"（Req 3.7）已经足够及时，同时避免过于频繁的
+    // Rust<->Slint 属性同步。
+    Timer {
+        interval: 1s;
+        running: true;
+        triggered => {
+            root.poll-elapsed();
+        }
+    }
+
+    // 物理键盘事件入口（模块顶部第 5、6 条）。声明在全部可见元素之前，
+    // 自身不渲染任何内容，只承担"接收按键 -> 原样上抛"的职责。
+    key-scope := FocusScope {
+        // 不参与点击取焦点，避免与右上角退出按钮的 `TouchArea` 争夺同一次
+        // 点击（见模块顶部第 6.c 条）。
+        focus-on-click: false;
+
+        // 进入练习环节时主动取焦点。`app.slint` 中练习界面是条件元素，
+        // 每次导航进入都会重新实例化并触发本 `init`，因此这是"孩子无需先
+        // 点一下窗口即可直接打字"的实际生效路径。
+        init => {
+            self.focus();
+        }
+
+        key-pressed(event) => {
+            // 原样上抛，不做任何过滤/判定（过滤在 Rust 侧
+            // `ui::practice_input_char`）。
+            root.char-input(event.text);
+            // 练习界面期望吞掉按键：返回 accept 阻止事件继续冒泡给父元素。
+            accept;
+        }
+    }
+
+    VerticalLayout {
+        padding: 24px;
+        // 底部单独加大留白，把键盘从窗口最下边缘往上顶一些——文本区改为
+        // 单行显示后腾出了不少竖直空间（见 `visible-char-rows` 的说明），
+        // 这些空间此前全部被"文本区居中"吃掉、键盘因此始终贴着窗口底边；
+        // 加大 `padding-bottom` 把其中一部分空间挪到键盘下方，键盘视觉位置
+        // 相应上移，不再紧贴底边。
+        padding-bottom: 120px;
+        spacing: 16px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: space-between;
+
+            Text {
+                text: "已用时长 " + root.elapsed-display;
+                font-size: 16px;
+                font-weight: 700;
+                color: Theme.muted-foreground;
+                vertical-alignment: center;
+            }
+
+            // 占位空间，为右上角固定锚点的退出按钮预留位置，避免时长文本
+            // 与退出按钮在水平布局中相互挤压重叠。
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+        }
+
+        // 练习文本区域：按字符位置逐一渲染 `PracticeCharCell`，自动换行
+        // 以适应任意长度的练习文本（Req 3.1：练习文本长度 1 至 500 字符）。
+        //
+        // 为什么不用 HorizontalLayout：Slint 没有"流式布局/自动折行布局"，
+        // `HorizontalLayout` 只会把所有字符格挤在一行里，超出可用宽度的部分
+        // 被直接裁掉（长文本时右侧字符不可见，且当前待输入位置可能正好落在
+        // 被裁掉的区域）。因此这里改为**自行按行列坐标绝对定位**：字符格是
+        // 固定尺寸（`char-cell-width` × `char-cell-height`），每行能放多少个
+        // 完全由可用宽度决定，于是第 i 个字符的行列号可以纯算术地算出：
+        //   列 = mod(i, chars-per-row)，行 = floor(i / chars-per-row)
+        // 这是纯粹的坐标换算（与"字符处于什么状态"这类业务判定无关），
+        // 因此写在 `.slint` 侧不违反本文件顶部的分层原则。
+        // 外层容器吃掉顶部信息行与虚拟键盘之间的全部剩余空间，并把文本网格在
+        // 其中垂直居中——否则文本会紧贴在顶部信息行下方，与下方键盘之间留下一
+        // 大片空白（"题目贴在很高的位置"）。
+        Rectangle {
+            vertical-stretch: 1;
+
+            VerticalLayout {
+                alignment: center;
+
+                // 水平居中：`text-area` 的宽度固定为 `KeyMetrics.board-width`
+                // （与下方虚拟键盘外壳同宽），不再随窗口宽度拉伸——这样文本区
+                // 与键盘在视觉上左右对齐，而不是文本区铺满整个窗口宽度、比
+                // 键盘宽出一大截。
+                HorizontalLayout {
+                    alignment: center;
+
+                    text-area := Flickable {
+                        width: KeyMetrics.board-width;
+                        // 高度按**实际行数**取（上限为可见行数，现为 1）：
+                        // 练习文本区一次只展示一行，随学员输入自动换行
+                        // （见上方 `visible-char-rows` 的说明），因此这里
+                        // 恒等于单行高度，不会随文本长度变化。
+                        height: min(root.char-row-count, root.visible-char-rows) * root.char-row-pitch - root.char-cell-gap;
+
+                        // 禁止横向滚动（内容永远按可用宽度折行，不会横向溢出），
+                        // 纵向按实际行数给出真实内容高度。
+                        viewport-width: self.width;
+                        viewport-height: max(self.height, root.char-row-count * root.char-row-pitch - root.char-cell-gap);
+
+                        // 跟随当前待输入位置滚动：始终把光标所在行保持在可见
+                        // 区域内。`visible-char-rows` 为 1 时，这一步就是
+                        // "光标进入下一行 -> 立即整行滚动到那一行"，即"这一行
+                        // 打完自动显示下一行"的实际实现。
+                        viewport-y: -root.first-visible-char-row * root.char-row-pitch;
+
+                        animate viewport-y {
+                            duration: 150ms;
+                        }
+
+                        for char-view[i] in root.chars: PracticeCharCell {
+                            view: char-view;
+                            // 尺寸绑定到 root 的几何常量：`chars-per-row` 正是按这两个
+                            // 常量反算出来的，两处必须是同一个数。
+                            width: root.char-cell-width;
+                            height: root.char-cell-height;
+                            x: mod(i, root.chars-per-row) * root.char-column-pitch;
+                            y: floor(i / root.chars-per-row) * root.char-row-pitch;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 键盘按首选高度渲染（不再吃剩余空间）：剩余空间已全部交给上方文本区，
+        // 键盘因此稳定地落在页面底部，与文本区的间距由布局 spacing 决定。
+        Rectangle {
+            vertical-stretch: 0;
+
+            VirtualKeyboard {
+                key-states: root.key-states;
+                pressed-key-index <=> root.pressed-key-index;
+                hint-needs-shift: root.hint-needs-shift;
+            }
+        }
+    }
+
+    // 退出按钮：固定锚定在右上角，尺寸不小于 44×44px（Req 7.4）。
+    // 使用绝对定位（x/y 相对 root）而不是参与上方 VerticalLayout 的排版流，
+    // 以保证"固定展示在屏幕固定位置"这一约束不受练习文本长度/键盘布局
+    // 变化的影响。
+    exit-button := TouchArea {
+        x: parent.width - self.width - 16px;
+        y: 16px;
+        // 恰好压到 Req 7.4 的下限（不小于 44×44px）：再大就会在顶部压出一块很
+        // 突兀的红色色块。
+        width: 64px;
+        height: 44px;
+
+        clicked => {
+            root.exit-requested();
+        }
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            border-radius: 8px;
+            background: exit-button.has-hover ? Theme.destructive-hover : Theme.destructive;
+
+            animate background {
+                duration: 120ms;
+            }
+
+            Text {
+                // 不使用 ✕（U+2715）这类符号字形：系统默认字体缺失该字形时会
+                // 渲染成豆腐块方框（□）。纯文字标签在任何中文字体下都可读。
+                text: "退出";
+                font-size: 15px;
+                font-weight: 700;
+                color: Theme.vivid-foreground;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

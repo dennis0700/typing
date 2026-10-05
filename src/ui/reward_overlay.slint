@@ -1,0 +1,148 @@
+// 奖励反馈展示组件（Req 7.3）。
+//
+// 对应领域层 `domain::stats::RewardFeedback`（`src/domain/stats.rs`）：
+// - `show-animation`  <-> `RewardFeedback.animation`
+// - `show-badge`      <-> `RewardFeedback.badge`
+// - `encouragement-text` <-> `RewardFeedback.encouragement_text`（空字符串表示 `None`）
+// - `display-duration-ms` <-> `RewardFeedback.display_duration_ms`
+//   （恒不小于 `MIN_REWARD_DISPLAY_DURATION_MS` = 2000ms）
+//
+// 本组件只负责奖励反馈的视觉展示与展示时长的计时，不直接控制页面导航：
+// 计时结束后通过 `dismissed()` 回调通知调用方（`ui.rs` 桥接层，任务 18.8），
+// 由调用方决定后续导航行为（如返回课程序列界面）。
+
+import { Theme } from "theme.slint";
+
+export component RewardOverlay inherits Rectangle {
+    // 是否当前处于展示状态。为 false 时整个遮罩不渲染、不占用交互层。
+    in-out property <bool> active: false;
+
+    // 三种反馈形式对应的输入属性，与 `RewardFeedback` 字段一一对应。
+    in property <bool> show-animation: false;
+    in property <bool> show-badge: false;
+    // 空字符串表示不展示鼓励文案（对应 `encouragement_text: None`）。
+    in property <string> encouragement-text: "";
+    // 展示时长（毫秒）。调用方应保证该值不小于 2000（Req 7.3 的最小时长约束），
+    // 组件本身也做兜底，避免因传入过小的值导致展示时长低于需求下限。
+    in property <int> display-duration-ms: 2000;
+
+    // 展示时长计时结束时触发，通知调用方奖励反馈应被关闭/收起。
+    // 本组件不自行修改 `active`，将“是否隐藏、是否导航”的决定权交给调用方，
+    // 以保持与设计文档中“UI 层不承载业务导航逻辑”的分层约定一致。
+    callback dismissed();
+
+    // 兜底保证计时时长不低于需求规定的 2 秒下限。
+    property <int> effective-duration-ms: max(display-duration-ms, 2000);
+
+    width: 100%;
+    height: 100%;
+
+    // 半透明背景遮罩，仅在展示时可见。
+    background: active ? Theme.overlay : transparent;
+
+    // 展示时长控制计时器：`active` 变为 true 时（重新）开始计时，
+    // 到时触发 `dismissed()`。
+    Timer {
+        interval: root.effective-duration-ms * 1ms;
+        running: root.active;
+        triggered => {
+            root.dismissed();
+        }
+    }
+
+    // 三种反馈形式在垂直方向由外层 `VerticalLayout { alignment: center; }`
+    // 居中；水平方向则必须**各自**再套一层 `HorizontalLayout { alignment:
+    // center; }`：`VerticalLayout` 只负责纵向排布，横向是靠"把子元素拉伸到
+    // 整行宽度"来实现对齐的，而动画圆点（96px）与徽章（160px）都显式声明了
+    // 宽度、不参与拉伸，于是会被摆在行首——表现为奖励图案贴在窗口左边。
+    // 鼓励文案没有显式宽度（会被拉满整行），靠自身
+    // `horizontal-alignment: center` 居中即可，无需包裹。
+    //
+    // 包裹层写在 `if` **内部**（`if 条件: HorizontalLayout { ... }`）而不是
+    // 外部：条件为假时整个包裹层一并不存在，不会在 `VerticalLayout` 里留下
+    // 一个空元素而多吃一份 16px 的 spacing。
+    VerticalLayout {
+        alignment: center;
+        spacing: 16px;
+
+        // 动画元素：淡入 + 缩放动画（opacity 0->1，scale 0.5->1.0）。
+        if root.active && root.show-animation: HorizontalLayout {
+            alignment: center;
+
+            Rectangle {
+                // 用于驱动淡入缩放动画的中间属性：`active` 变为 true 时目标值跳变，
+                // `animate` 语法负责在 300ms 内插值过渡。
+                property <float> reveal-progress: root.active ? 1.0 : 0.0;
+
+                animate reveal-progress {
+                    duration: 300ms;
+                    easing: ease-out;
+                }
+
+                opacity: reveal-progress;
+                // 缩放范围 0.5 -> 1.0（基准尺寸 96px）。宽度变化时始终由外层
+                // `alignment: center` 保持水平居中，因此视觉上是"从中心放大"。
+                width: 96px * (0.5 + 0.5 * reveal-progress);
+                height: 96px * (0.5 + 0.5 * reveal-progress);
+
+                Rectangle {
+                    width: 100%;
+                    height: 100%;
+                    border-radius: self.width / 2;
+                    background: Theme.warning;
+
+                    Text {
+                        text: "★";
+                        font-size: 40px;
+                        color: Theme.vivid-foreground;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // 徽章元素：圆角矩形 + 星形/勾选标记。
+        if root.active && root.show-badge: HorizontalLayout {
+            alignment: center;
+
+            Rectangle {
+                width: 160px;
+                height: 64px;
+                border-radius: Theme.radius-lg;
+                background: Theme.success;
+
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 8px;
+
+                    Text {
+                        text: "✓";
+                        font-size: 24px;
+                        font-weight: 700;
+                        color: Theme.vivid-foreground;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        text: "课程完成";
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: Theme.vivid-foreground;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // 鼓励文案：非空字符串时展示。
+        if root.active && root.encouragement-text != "": Text {
+            text: root.encouragement-text;
+            font-size: 22px;
+            font-weight: 700;
+            color: Theme.vivid-foreground;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+}

@@ -1,0 +1,149 @@
+// 设计令牌（design tokens）：全应用配色/圆角/阴影的**唯一**权威定义。
+//
+// ## 为什么是 shadcn 的令牌体系
+//
+// 设计文档在多处提到 "slintcn 主题色变量"，但此前各 `.slint` 文件里写的是
+// 互不相干的字面量色值（Material 的 `#4caf50`/`#2196f3`/`#d32f2f`、随手取的
+// `#555555`/`#777777`/`#eaeaea`、以及少量 Tailwind 色），同一语义在不同页面
+// 用不同颜色表达，无法整体调色。本文件按 shadcn/ui 默认浅色主题（zinc 基色）
+// 的语义令牌重建这一层：`background`/`foreground`/`card`/`muted`/`border`/
+// `primary`/`secondary`/`destructive`/`ring`/`radius`，取值即 shadcn 默认主题
+// 的 HSL 变量换算成的十六进制值。
+//
+// ## 与 Req 7「界面色彩鲜明」的调和
+//
+// shadcn 默认主题本身是近乎无彩的中性灰阶（primary 是 zinc-900），直接整体
+// 套用会让一个给孩子用的应用显得过于冷淡，与 Req 7 的 "界面色彩鲜明" 冲突。
+// 因此这里采取分层策略：
+//
+// - **界面骨架**（页面底色、卡片、边框、次要文字、弹窗）使用 shadcn 的中性
+//   语义令牌，保证信息层级清晰、留白与圆角一致；
+// - **面向孩子的状态色**（手指分区、字符对错、成绩升降、奖励反馈、危险操作）
+//   使用饱和的 Tailwind 500/600 级色值。这与 shadcn 自身处理数据可视化的
+//   方式一致（它的 `--chart-1..5` 同样是跳出中性色阶的饱和色），并非偏离
+//   该体系。
+//
+// 所有色值集中在此处的直接好处：换主题（比如将来做深色模式或换基色）只需
+// 改本文件，不必再去 8 个 `.slint` 文件里逐个查找字面量。`ui.rs` 中的
+// `slint_theme_tokens_are_the_only_source_of_colors` 会静态校验这一约束。
+export global Theme {
+    // ---- shadcn 中性语义令牌（默认浅色主题 / zinc 基色）----
+
+    // 页面最底层背景与其上的正文色。
+    out property <color> background: #ffffff; // hsl(0 0% 100%)
+    out property <color> foreground: #09090b; // hsl(240 10% 3.9%)
+
+    // 卡片/面板表面（列表条目、成绩面板等）。
+    out property <color> card: #ffffff;
+    out property <color> card-foreground: #09090b;
+
+    // 浮层表面（对话框、Toast 之外的弹出层）。
+    out property <color> popover: #ffffff;
+    out property <color> popover-foreground: #09090b;
+
+    // 主操作色：shadcn 的 primary 是近黑的 zinc-900，用于最高优先级按钮与
+    // 深色 Toast 背景。
+    out property <color> primary: #18181b; // hsl(240 5.9% 10%)
+    out property <color> primary-foreground: #fafafa; // hsl(0 0% 98%)
+    out property <color> primary-hover: #27272a; // zinc-800，等价于 hover:bg-primary/90
+
+    // 次要操作色：浅灰底 + 深色文字（"取消"这类不需要吸引注意的按钮）。
+    out property <color> secondary: #f4f4f5; // hsl(240 4.8% 95.9%)
+    out property <color> secondary-foreground: #18181b;
+    out property <color> secondary-hover: #e4e4e7; // zinc-200
+
+    // 弱化区域：页面底色的浅灰、被禁用/锁定条目的底色。
+    out property <color> muted: #f4f4f5;
+    out property <color> muted-foreground: #71717a; // hsl(240 3.8% 46.1%)
+
+    // 强调（hover 高亮）：shadcn 中列表条目 hover 用的就是 accent。
+    out property <color> accent: #f4f4f5;
+    out property <color> accent-foreground: #18181b;
+
+    // 列表条目（档案卡片、课程卡片）的悬停底色。
+    //
+    // **刻意不用 `accent`**：在 shadcn 默认主题里 `accent` 与 `muted` 是同一个值
+    // （都是 zinc-100 `#f4f4f5`），而 `muted` 正是本应用用来表示"未解锁/弱化"的
+    // 底色。用 accent 做悬停的后果是：鼠标指到的那张卡片变成和"锁定"一样的灰，
+    // 而旁边那张白色的卡片反倒显得更亮——实际用起来会以为高亮跑到了下一行。
+    //
+    // 因此这里取一个与中性灰阶**正交**的浅蓝（Tailwind blue-100）：它与白色底
+    // （`card`）有明显区分度、又不会被误读成灰色的禁用态。是本应用对 shadcn
+    // 令牌集的扩展，`ui.rs` 的 `list_card_hover_color_is_visually_distinct` 会
+    // 校验它与 `card`/`muted` 都保持足够的色差。
+    out property <color> card-hover: #dbeafe; // blue-100
+
+    // 危险操作：删除、输入错误、成绩下降。
+    out property <color> destructive: #ef4444; // hsl(0 84.2% 60.2%)
+    out property <color> destructive-foreground: #fafafa;
+    out property <color> destructive-hover: #dc2626; // red-600
+
+    // 描边与输入框边框、焦点环。
+    out property <color> border: #e4e4e7; // hsl(240 5.9% 90%)
+    out property <color> input: #e4e4e7;
+    out property <color> ring: #18181b;
+
+    // 比 muted 更深一档的"凹陷"表面。用于需要与卡片明确区分的容器
+    // （虚拟键盘外壳）——shadcn 没有对应令牌，这是本应用的扩展。
+    out property <color> surface-sunken: #e4e4e7;
+
+    // 模态遮罩：对应 shadcn Dialog 的 `bg-black/80`。
+    out property <color> overlay: #000000cc;
+
+    // ---- 状态色（面向孩子的饱和色，见文件顶部关于 Req 7 的说明）----
+
+    // 成功/正向：完成、正确率、成绩提升、主要正向 CTA（创建档案、继续）。
+    out property <color> success: #22c55e; // green-500
+    out property <color> success-hover: #16a34a; // green-600
+
+    // 提醒/待办：键位提示、奖励星标、"重置进度"这类可逆但需谨慎的操作。
+    out property <color> warning: #f59e0b; // amber-500
+    out property <color> warning-hover: #d97706; // amber-600
+    out property <color> warning-foreground: #b45309; // amber-700，浅色底上的警示文字
+    out property <color> warning-foreground-strong: #92400e; // amber-800，警示标题
+
+    // 信息：打字速度这类中性数值指标。
+    out property <color> info: #3b82f6; // blue-500
+
+    // 叠在上述饱和色块之上的文字色。中性令牌的 `*-foreground` 是 #fafafa，
+    // 但饱和底色上用纯白对比度更高，故单独给一个令牌。
+    out property <color> vivid-foreground: #ffffff;
+
+    // 字符匹配三态（Req 3.4：正确与错误的视觉样式必须可区分）。
+    out property <color> char-correct-bg: #dcfce7; // green-100
+    out property <color> char-correct-fg: #16a34a; // green-600
+    out property <color> char-error-bg: #fee2e2; // red-100
+    out property <color> char-error-fg: #dc2626; // red-600
+    out property <color> char-pending-bg: #f4f4f5; // = muted
+    out property <color> char-pending-fg: #71717a; // = muted-foreground
+
+    // 键位提示的高亮描边（Req 2.3）。必须与下方 10 个分区色都能区分，
+    // 因此不复用 `ring`（近黑）而用高亮黄。
+    out property <color> key-hint-ring: #facc15; // yellow-400
+
+    // ---- 手指分区色（Req 2.1：10 个分区、10 种互不相同且可区分的颜色）----
+    //
+    // 取 Tailwind 500 级色环上间隔均匀的 8 个色相 + 2 个中性灰蓝（拇指区）。
+    // 拇指区之所以用中性色：空格是唯一由拇指负责的键，用灰蓝可以与 8 个
+    // 字母/数字区的彩色形成层级区分，同时左右拇指之间仍保持深浅差异。
+    out property <color> zone-left-pinky: #ef4444; // red-500
+    out property <color> zone-left-ring: #f97316; // orange-500
+    out property <color> zone-left-middle: #eab308; // yellow-500
+    out property <color> zone-left-index: #22c55e; // green-500
+    out property <color> zone-left-thumb: #94a3b8; // slate-400
+    out property <color> zone-right-thumb: #64748b; // slate-500
+    out property <color> zone-right-index: #14b8a6; // teal-500
+    out property <color> zone-right-middle: #3b82f6; // blue-500
+    out property <color> zone-right-ring: #8b5cf6; // violet-500
+    out property <color> zone-right-pinky: #ec4899; // pink-500
+
+    // ---- 圆角（shadcn `--radius: 0.5rem`）----
+    out property <length> radius-sm: 6px; // calc(var(--radius) - 2px)
+    out property <length> radius: 8px;
+    out property <length> radius-lg: 12px; // 按钮/对话框内的大圆角
+    out property <length> radius-xl: 16px; // 对话框外框
+
+    // ---- 阴影 ----
+    out property <color> shadow: #0f172a33;
+    out property <color> shadow-soft: #0f172a22;
+}

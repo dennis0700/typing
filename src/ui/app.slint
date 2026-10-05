@@ -1,0 +1,218 @@
+// 顶层窗口与页面路由骨架 + 全局浮层层。
+//
+// ## 页面（`AppPage`）与浮层（overlay）的区别
+//
+// `AppPage` 枚举描述的是"互斥的整屏页面"：档案选择 / 课程序列 / 练习环节，
+// 同一时刻只渲染其中一个。
+//
+// 而结果统计（`ResultSummary`）、奖励反馈（`RewardOverlay`）、正确答案提示
+// （`AnswerHint`）、全局提示（`Toast`）都是**叠加在当前页面之上的浮层**，
+// 不参与 `current-page` 路由。这一设计直接来自 Rust 侧
+// `AppController::handle_practice_completion()` 返回的命令序列：
+// `[NavigateTo(CurriculumSequence), ShowPracticeResult(..),
+//   (ShowToast(..)), ShowRewardFeedback(..)]`
+// ——练习完成时先导航回课程序列界面，再叠加展示结果与奖励，因此二者必须
+// 是浮层而不是新的独立页面。
+//
+// 浮层元素统一声明在全部 `if current-page == ..` 页面之后，利用 Slint 的
+// 声明顺序即 z 序的规则保证浮层始终渲染在页面之上；层级由低到高为：
+// 结果统计 -> 奖励反馈 -> 正确答案提示 -> 全局 Toast。
+//
+// ## 分层约定
+//
+// 所有浮层都遵循与 `reward_overlay.slint` 相同的约定：组件自身不修改自己
+// 的可见状态、不做导航，只在计时结束/用户点击时发出回调，由 Rust 侧桥接层
+// （`ui.rs`）决定后续行为。因此本文件里的浮层接线也只是"属性透传 + 回调
+// 原样上抛"，不含任何业务判断。
+
+import { AnswerHint } from "answer_hint.slint";
+import { ComparisonDirection, ResultSummary } from "result_summary.slint";
+import { Toast } from "toast.slint";
+
+import { CurriculumMap, LessonCardData } from "curriculum_map.slint";
+import { PracticeView, PracticeCharView } from "practice_view.slint";
+import { ProfileSelectPage, ProfileSummary } from "profile_select.slint";
+import { RewardOverlay } from "reward_overlay.slint";
+import { KeyState } from "virtual_keyboard.slint";
+
+export enum AppPage {
+    profile-select,
+    curriculum-map,
+    practice-view,
+}
+
+export component AppWindow inherits Window {
+    title: "打字学习";
+    width: 960px;
+    height: 640px;
+
+    in-out property <AppPage> current-page: AppPage.profile-select;
+
+    // 档案选择界面的透传属性/回调（Req 6.2, 6.4, 6.5, 6.6, 6.7）。
+    // 暴露在 AppWindow 顶层，供 Rust 侧桥接层（任务 18.8）绑定
+    // `AppController::dispatch` 产生的数据与 `AppEvent::SelectProfile`/
+    // `AppEvent::CreateProfile` 事件，当前任务（18.2）仅负责将其原样传递给
+    // `ProfileSelectPage`。
+    in-out property <[ProfileSummary]> profiles: [];
+    in-out property <string> nickname-error: "";
+    callback select-profile(string);
+    callback create-profile(string);
+    // 档案管理（Req 6.8-6.14）。三者都已在 `ProfileSelectPage` 内经过二次
+    // 确认弹窗，到达这里即代表用户已明确确认。
+    callback delete-profile(string);
+    callback reset-profile-progress(string);
+    callback rename-profile(string, string);
+
+    if current-page == AppPage.profile-select: ProfileSelectPage {
+        profiles: root.profiles;
+        nickname-error: root.nickname-error;
+        select-profile(id) => { root.select-profile(id); }
+        create-profile(nickname) => { root.create-profile(nickname); }
+        delete-profile(id) => { root.delete-profile(id); }
+        reset-profile-progress(id) => { root.reset-profile-progress(id); }
+        rename-profile(id, nickname) => { root.rename-profile(id, nickname); }
+    }
+
+    // 课程序列界面的透传属性/回调（Req 1.2, 1.6, 1.7）。
+    // 与档案选择界面的接入方式一致：当前任务（18.3）仅负责将 Rust 侧
+    // 计算好的课程卡片视图模型与回调原样传递给 `CurriculumMap`，真正的
+    // `AppEvent::SelectLesson` 派发与解锁条件提示逻辑由未来的桥接层
+    // （任务 18.8）实现。
+    in-out property <[LessonCardData]> lessons: [];
+    callback lesson-selected(int);
+    // 课程序列界面左上角"返回"：回到档案选择界面（切换学员/管理档案）。
+    callback exit-to-profile-select();
+    callback locked-lesson-tapped(int);
+
+    if current-page == AppPage.curriculum-map: CurriculumMap {
+        lessons: root.lessons;
+        lesson-selected(index) => { root.lesson-selected(index); }
+        back-requested() => { root.exit-to-profile-select(); }
+        locked-lesson-tapped(index) => { root.locked-lesson-tapped(index); }
+    }
+
+    // 练习环节界面的透传属性/回调（Req 3.2, 3.3, 3.4, 3.6, 3.7, 7.1, 7.4）。
+    // 与档案选择界面/课程序列界面的接入方式一致：把 Rust 侧计算好的字符
+    // 视图模型、已用时长显示文本与按键状态数组原样传递给 `PracticeView`，
+    // `poll-elapsed`/`exit-requested`/`char-input` 回调同样只是原样转发到
+    // `AppWindow` 顶层，真正的 `elapsed()` 读取、`AppEvent::ExitPractice`/
+    // `AppEvent::CharInput` 派发均由 Rust 侧桥接层（`ui.rs`）实现。
+    //
+    // `practice-char-input(string)` 携带的是 Slint `KeyEvent.text` 的原始
+    // 值（可能是控制字符或非打印键对应的私用区字符）；本文件不做过滤，
+    // 由 `ui::practice_input_char` 统一判定，理由见 `practice_view.slint`
+    // 顶部第 5 条。
+    in-out property <[PracticeCharView]> practice-chars: [];
+    // 当前待输入字符的下标（`TypingMatchState::cursor`）。仅用于练习文本
+    // 折行后把光标所在行滚动到可见区域，见 `practice_view.slint` 的
+    // `cursor` 属性说明。
+    in-out property <int> practice-cursor: 0;
+    in-out property <string> practice-elapsed-display: "00:00";
+    in-out property <[KeyState]> practice-key-states: [];
+    // 当前提示键位是否需要按住 Shift；驱动虚拟键盘上左右 Shift 键的高亮
+    // （见 `virtual_keyboard.slint` 中 `hint-needs-shift` 的说明）。
+    in-out property <bool> practice-hint-needs-shift: false;
+    // 当前被按下的键位在 `practice-key-states` 中的下标（敲击动画）；Rust 侧
+    // 每次收到按键时写入，虚拟键盘内的计时器在 90ms 后自动清回 -1。
+    in-out property <int> practice-pressed-key-index: -1;
+    callback practice-poll-elapsed();
+    callback practice-exit-requested();
+    callback practice-char-input(string);
+
+    if current-page == AppPage.practice-view: PracticeView {
+        chars: root.practice-chars;
+        cursor: root.practice-cursor;
+        elapsed-display: root.practice-elapsed-display;
+        key-states: root.practice-key-states;
+        hint-needs-shift: root.practice-hint-needs-shift;
+        pressed-key-index <=> root.practice-pressed-key-index;
+        poll-elapsed() => { root.practice-poll-elapsed(); }
+        exit-requested() => { root.practice-exit-requested(); }
+        char-input(text) => { root.practice-char-input(text); }
+    }
+
+    // ---------------------------------------------------------------------
+    // 全局浮层层（叠加在上方任一页面之上，不参与 `current-page` 路由）
+    // ---------------------------------------------------------------------
+
+    // 结果统计浮层（Req 4.1, 4.2, 4.4, 4.5）。
+    // 全部数值与比较结果都由 Rust 侧算好后写入这些属性：`result-accuracy`/
+    // `result-wpm` 来自 `domain::calc_accuracy`/`calc_wpm`（已落在
+    // `PracticeResult` 中），`result-comparison-direction`/`*-delta` 来自
+    // `domain::compare_with_best`。`.slint` 侧不做任何比较或换算。
+    in-out property <bool> result-active: false;
+    in-out property <int> result-duration-ms: 0;
+    in-out property <int> result-error-count: 0;
+    in-out property <float> result-accuracy: 0.0;
+    in-out property <float> result-wpm: 0.0;
+    in-out property <ComparisonDirection> result-comparison-direction: ComparisonDirection.first-record;
+    in-out property <float> result-accuracy-delta: 0.0;
+    in-out property <float> result-wpm-delta: 0.0;
+    callback result-dismissed();
+
+    ResultSummary {
+        active: root.result-active;
+        duration-ms: root.result-duration-ms;
+        error-count: root.result-error-count;
+        accuracy: root.result-accuracy;
+        wpm: root.result-wpm;
+        comparison-direction: root.result-comparison-direction;
+        accuracy-delta: root.result-accuracy-delta;
+        wpm-delta: root.result-wpm-delta;
+        dismissed() => { root.result-dismissed(); }
+    }
+
+    // 奖励反馈浮层（Req 7.3）。属性与 `domain::RewardFeedback` 一一对应：
+    // `reward-show-animation` <-> `animation`、`reward-show-badge` <-> `badge`、
+    // `reward-encouragement-text` <-> `encouragement_text`（`None` 写空字符串）、
+    // `reward-display-duration-ms` <-> `display_duration_ms`。
+    //
+    // 展示顺序：奖励反馈（庆祝）先展示，其内部 `Timer` 到时触发
+    // `reward-dismissed()`；Rust 侧在该回调中关闭奖励浮层，再把暂存的结果
+    // 统计置为 active，避免两个浮层同时可见互相遮挡（串联逻辑见 `ui.rs`）。
+    in-out property <bool> reward-active: false;
+    in-out property <bool> reward-show-animation: false;
+    in-out property <bool> reward-show-badge: false;
+    in-out property <string> reward-encouragement-text: "";
+    in-out property <int> reward-display-duration-ms: 2000;
+    callback reward-dismissed();
+
+    RewardOverlay {
+        active: root.reward-active;
+        show-animation: root.reward-show-animation;
+        show-badge: root.reward-show-badge;
+        encouragement-text: root.reward-encouragement-text;
+        display-duration-ms: root.reward-display-duration-ms;
+        dismissed() => { root.reward-dismissed(); }
+    }
+
+    // 「展示正确答案」提示浮层（Req 7.6）。`answer-hint-message` 非空即可见；
+    // 学员点击"继续下一题"时上抛 `answer-hint-continue()`，Rust 侧据此清空
+    // 文案并派发 `AppEvent::SkipCurrentItem`。
+    in-out property <string> answer-hint-message: "";
+    in-out property <string> answer-hint-answer: "";
+    callback answer-hint-continue();
+
+    AnswerHint {
+        message: root.answer-hint-message;
+        answer-text: root.answer-hint-answer;
+        continue-requested() => { root.answer-hint-continue(); }
+    }
+
+    // 全局提示浮层（`UiCommand::ShowToast` / `ShowEncouragement`，
+    // Req 1.7、5.5、7.2）。`toast-message` 非空即可见，计时结束后上抛
+    // `toast-dismissed()`，由 Rust 侧把文案置回空字符串。
+    //
+    // 注意：档案选择界面的昵称校验错误（Req 6.5, 6.7）**不**走这里，而是
+    // 写入 `nickname-error` 内联展示在输入框旁——路由策略与理由见 `ui.rs`
+    // 中 `toast_target_for_page()` 的文档注释。
+    in-out property <string> toast-message: "";
+    in-out property <int> toast-display-duration-ms: 3000;
+    callback toast-dismissed();
+
+    Toast {
+        message: root.toast-message;
+        display-duration-ms: root.toast-display-duration-ms;
+        dismissed() => { root.toast-dismissed(); }
+    }
+}

@@ -1,0 +1,99 @@
+// 全局提示浮层（Toast）——承载 `UiCommand::ShowToast` 与
+// `UiCommand::ShowEncouragement` 两类"短暂展示、无需用户确认"的提示信息
+// （Req 1.7 未解锁提示、Req 5.5 保存失败提示、Req 7.2 鼓励性提示等）。
+//
+// 分层约定（与 `reward_overlay.slint` 完全一致，也是本项目 `.slint` 侧的
+// 通用约定）：
+//
+// 1. 本组件不承载任何业务判断。"该展示什么文案""什么情况下该展示"全部由
+//    Rust 侧 `AppController::dispatch` 产出的 `UiCommand` 决定，桥接层
+//    （`ui.rs`）只是把文案写进 `message` 属性。
+// 2. 本组件不修改自己的可见状态：`message` 是唯一的可见性来源（非空即
+//    可见、空字符串即完全不渲染），计时结束后只通过 `dismissed()` 回调
+//    通知调用方"该清空文案了"，由调用方（Rust 侧）把 `message` 置回空
+//    字符串。这样"提示何时消失"这一决定权始终留在 Rust 侧，避免 UI 层
+//    出现一份与 Rust 侧不一致的隐藏状态。
+// 3. `message` 为空字符串时，浮层内部不渲染任何元素；root 本身只是一个
+//    背景透明的 `Rectangle`（不是 `TouchArea`，不参与命中测试），因此
+//    不会遮挡下方页面的交互。
+//
+// 视觉约定：
+// - 文字使用 20px 大号字体 + 加粗，符合设计文档"儿童友好的可读性"要求。
+// - `max-width: 640px` + `wrap: word-wrap`：较长的提示文案（如解锁条件
+//   说明）会自动换行，不会被裁切或撑破窗口。
+// - 淡入动画：`reveal-progress` 在 `message` 变为非空时由 0 过渡到 1，
+//   驱动整张提示卡片的 `opacity`，避免文案突然跳出来惊扰孩子。
+//
+// 注意：本组件内没有任何可点击控件（`TouchArea`），因此不涉及 Req 7.1
+// 的"最小可点击目标 44×44px / 相邻可点击控件间距 ≥8px"约束；需要用户
+// 主动确认的提示（Req 7.6 的"展示正确答案 + 继续下一题"）由
+// `answer_hint.slint` 的 `AnswerHint` 组件承载，而不是复用本组件。
+
+import { Theme } from "theme.slint";
+
+export component Toast inherits Rectangle {
+    // 提示文案。非空时浮层可见，空字符串时完全不渲染（也不占用交互层）。
+    in property <string> message: "";
+
+    // 自动消失的展示时长（毫秒）。由 Rust 侧透传，组件内部做一个 1500ms
+    // 的下限兜底，避免传入过小的值导致提示一闪而过、孩子来不及阅读。
+    in property <int> display-duration-ms: 3000;
+
+    // 展示时长计时结束时触发，通知调用方把 `message` 置回空字符串。
+    // 本组件自身不修改 `message`（见上方分层约定第 2 条）。
+    callback dismissed();
+
+    property <int> effective-duration-ms: max(root.display-duration-ms, 1500);
+    property <bool> shown: root.message != "";
+
+    // 淡入动画的驱动属性：`shown` 跳变时目标值跳变，`animate` 负责插值。
+    property <float> reveal-progress: root.shown ? 1.0 : 0.0;
+
+    animate reveal-progress {
+        duration: 200ms;
+        easing: ease-out;
+    }
+
+    width: 100%;
+    height: 100%;
+    background: transparent;
+
+    // 自动消失计时器：`message` 非空时开始计时，到时触发 `dismissed()`。
+    Timer {
+        interval: root.effective-duration-ms * 1ms;
+        running: root.shown;
+        triggered => {
+            root.dismissed();
+        }
+    }
+
+    // 顶部居中锚定：提示浮层出现在窗口上方，不遮挡练习文本与虚拟键盘。
+    VerticalLayout {
+        alignment: start;
+        padding: 24px;
+
+        HorizontalLayout {
+            alignment: center;
+
+            if root.shown: Rectangle {
+                opacity: root.reveal-progress;
+                max-width: 640px;
+                background: Theme.primary;
+                border-radius: 12px;
+
+                VerticalLayout {
+                    padding: 16px;
+
+                    Text {
+                        text: root.message;
+                        font-size: 20px;
+                        font-weight: 700;
+                        color: Theme.primary-foreground;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+        }
+    }
+}
